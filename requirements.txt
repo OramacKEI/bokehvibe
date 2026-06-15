@@ -1,0 +1,25 @@
+# 光学像差可控的轻量级散景渲染 —— Python 依赖
+# 目标环境：独立 conda env `bokeh`，python 3.11，单卡 12GB (RTX 3060/4060)。
+#
+# torch 请按本机 CUDA 单独安装（本机驱动 580 -> CUDA 12.8）：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# 故此处不锁定 torch 版本，避免装错 CUDA 轮子。
+
+# --- 数值/图像基础 ---
+numpy
+scipy
+pillow
+opencv-python
+matplotlib          # PSF / 深度图 / 散景结果的最小可视化
+
+# --- 配置/工具 ---
+pyyaml              # 读取 configs/*.yaml
+tqdm
+einops              # 张量重排，渲染器/网络里常用
+
+# --- 评测/损失 ---
+lpips               # 感知损失 + 真实感指标
+scikit-image        # PSNR / SSIM
+
+# --- 深度骨干（DA V2-Small 推理）---
+# Depth Anything V2 走官方仓库/权重，按 depth/estimator.py 落地时再确定具体依赖（timm 等）。

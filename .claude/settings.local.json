@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(~/anaconda3/envs/ultralytics/bin/python -m render.demo)",
+      "WebSearch"
+    ]
+  }
+}

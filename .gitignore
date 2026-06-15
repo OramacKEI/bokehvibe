@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# 大文件 / 不入库的数据与权重
+refs/*.pdf            # 参考论文 PDF（本地副本，勿入库）
+outputs/              # checkpoint、可视化、日志
+data/datasets/        # RealBokeh / EBB! 等真实数据集
+third_party/          # 上游仓库 BokehMe / Depth-Anything-V2（各自有 git，不嵌套入库）
+checkpoints/          # 下载的预训练权重（DA V2-Small 等）
+*.ckpt
+*.pth
+*.pt
+
+# 环境与编辑器
+.venv/
+.env
+.DS_Store
+.vscode/
+
+# 保留空目录占位
+!**/.gitkeep

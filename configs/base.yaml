@@ -1,0 +1,56 @@
+# configs/base.yaml
+# 基础实验配置。所有默认值以「12GB 单卡 (RTX 3060/4060/5070)」为上限（CLAUDE.md 第 5 节）。
+# 各字段与代码默认值保持一致；改这里之前先确认对应模块是否真的读取该字段
+#（M2 训练接入时统一改为从本文件读配置，当前部分模块仍用代码内默认值）。
+
+project:
+  name: aberration-bokeh
+  seed: 42
+  device: cuda          # 物理验证(optics/)在 cpu 也能跑；渲染/训练用 cuda
+
+# --- 深度（冻结，仅推理）---
+depth:
+  model: depth_anything_v2_small   # 仅 Small：Apache-2.0，25M（DECISIONS D2）
+  normalize_disparity: true        # 统一归一化到 [0,1]，语义=视差(近大远小)
+  snap_edges: true                 # 渲染前做视差边缘吸附（DECISIONS D13），训练输入侧同样适用
+
+# --- 光学/PSF（无权重，技术心脏）---
+optics:
+  pupil_size: 256        # 光瞳/FFT 网格分辨率。决定离焦上限 W020 < N/8 ≈ 32 waves
+  spectral_average: true # 光谱平均：±6% 带宽 3 子波长，消单色相干环纹（DECISIONS D16）
+  enable_chromatic: true # 逐通道 PSF（LoCA/LaCA 色差）
+  # 注意：PSF 字典仅作【推理缓存】（DECISIONS D9）；训练/标定按层现场算 PSF，
+  # 下面两个分桶数只在构建推理缓存时使用。
+  cache_H_bins: 8
+  cache_defocus_bins: 16
+
+# --- 渲染（无权重，render/renderer.py 的 RenderControl 对应项）---
+render:
+  n_layers: 24           # 视差分层数（tent 软权重）
+  tile: 64               # 视场相关 tile 边长（D8）
+  H_bins: 6              # tile 路径的像高分桶数
+  balance_spherical_focus: true   # 球差焦移补偿（D14）
+  # focus_tolerance 由使用方按场景实测设定（demo 取主体视差 p15~p85 半宽）
+
+# --- 细化网（唯一可训练，~1–2M）---
+refine:
+  max_params_million: 2.0   # 硬上限，超出即违反轻量铁律
+  film_cond: true           # 控制向量经 FiLM 注入
+  cond_dim: 13              # ctrl_vec 维度（定义见 data/synth.py make_sample，洋葱圈移除后为 13）
+  # --- 细化网 v2 (P1) 开关（NETWORK_DESIGN §4；全关 = 复现 v1）---
+  spatial_cond: true        # P1a 空间物理条件图（H/sin az/cos az 逐像素，+3ch）
+  psf_desc: true            # P1b PSF 描述子图（r_eq/elong/取向/环比/T，+6ch；需 spatial_cond）
+  mask_edge_gate: true      # 误差图×视差边缘带门控（找补对策 b，PROJECT_STATUS §6 2026-06-12）
+
+# --- 训练（12GB 约束）---
+train:
+  crop: 512        # 512 起步，谨慎尝试 1024
+  batch_size: 4    # 4 起步，按显存上探
+  lr: 1.0e-4
+  losses: [l1, perceptual]   # 重建：L1 + VGG/LPIPS（CLAUDE.md 第 8 节）
+  lambda_perceptual: 0.1     # 感知损失权重（对融合输出 B）
+  # 防"误差图塌缩"的两项辅助损失（DECISIONS D19，BokehMe 同款对策）：
+  lambda_neural: 0.5         # 神经分支直接监督 L1(B_neural, GT)，不经 mask 门控
+  lambda_mask: 0.2           # 误差图显式监督 L1(m, m_gt)
+  mask_gain: 10.0            # m_gt = clamp(gain·|B_phys−GT|, 0, 1)
+  boundary_weight: 4.0       # 重建损失逐像素权重 1+bw·m_gt（边界梯度防稀释）

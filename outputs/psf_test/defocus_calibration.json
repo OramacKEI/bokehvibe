@@ -1,0 +1,9 @@
+{
+  "pupil_size": 256,
+  "slope_px_per_wave": 3.9314827295520414,
+  "intercept_px": 0.17888984533832983,
+  "theory_slope": 4.0,
+  "max_rel_err_vs_theory": 0.08101212978363037,
+  "w020_nyquist_limit_waves": 32.0,
+  "usage": "W020 = (r_px - intercept_px) / slope_px_per_wave"
+}
