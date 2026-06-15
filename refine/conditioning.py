@@ -262,7 +262,8 @@ def field_geometry(shape, device, dtype=None, H_field: float = None,
 # 4) 边界带门控（找补对策 b）
 # ==============================================================================
 def boundary_band(disparity, ctrl, edge_thresh: float = 0.04,
-                  pad_px: int = 8, soften: int = 7):
+                  pad_px: int = 8, soften: int = 7,
+                  focus_gate: bool = True, focus_frac: float = 0.25):
     """视差边缘带 ∈ [0,1]：误差图 m 的物理活动范围（m ← m·band）。
 
     物理依据：分层渲染的边界瑕疵（渗色/硬边/半透明圈）只可能出现在
@@ -270,14 +271,24 @@ def boundary_band(disparity, ctrl, edge_thresh: float = 0.04,
     带外强制 m=0 → 网络在平坦/纹理区无法启用神经分支，从结构上杜绝
     "把虚化纹理找补回锐利"的红线违规（PROJECT_STATUS §6 [2026-06-12] 的根因②）。
 
+    ⚠️ 焦邻近门（D23，找补对策 b 的强化）：只看"视差跳变"对【密集碎边缘的远背景】
+    （成片树枝/草丛）失效——那里处处跳变，边带≈全图，门形同虚设，网络照样把
+    虚化的背景纹理找补回锐利（train_run3 真实图核图实测）。真正需要神经修复的
+    遮挡边界，至少一侧应贴近焦区（清晰/浅虚化的主体）；而找补的害处全在
+    【远离焦区、|CoC| 很大】的深背景碎边缘。故叠加一道焦邻近门：边缘还要落在
+    "邻域内存在清晰内容（|CoC| < focus_frac·最大|CoC|）"处才放行。远背景碎边缘
+    （两侧都重度虚化）→ 焦门=0 → 强制回落 B_phys（虚化），从结构上掐断背景找补。
+
     实现：5×5 窗口的视差极差 > edge_thresh 判为边缘（snap_disparity_edges 同款
     判据）→ 1/4 分辨率上 max-pool 扩张（半径 = 最大|CoC| + pad，省算力且带边
-    精度无关紧要——这是宽松的门，不是精确分割）→ 上采样 + 均值滤波软化
-    （避免硬门在融合输出上印出接缝）。
+    精度无关紧要——这是宽松的门，不是精确分割）→ 焦邻近门同样扩张 rad 后相乘
+    → 上采样 + 均值滤波软化（避免硬门在融合输出上印出接缝）。
 
     Args:
         disparity: [H,W] 网络输入侧视差。
         ctrl: RenderControl（算最大 |CoC| 用 d_f/K/tol）。
+        focus_gate: 是否叠加焦邻近门（默认开；关掉=退回纯边缘带的旧行为）。
+        focus_frac: 清晰判据阈值 = focus_frac × 图内最大|CoC|（越小越严，越压背景）。
     Returns:
         [1,H,W] 软门控图（边带≈1，远离边界→0）。
     """
@@ -293,13 +304,25 @@ def boundary_band(disparity, ctrl, edge_thresh: float = 0.04,
     # 扩张半径 = 图内实际出现的最大 |CoC|（≤ 标定上限 128px）+ 余量。
     r_map = signed_coc(disparity, float(ctrl.focus_disparity),
                        float(ctrl.aperture_K), float(ctrl.focus_tolerance))
-    rad = int(min(float(r_map.abs().max()), 128.0)) + pad_px
+    rad_max = min(float(r_map.abs().max()), 128.0)
+    rad = int(rad_max) + pad_px
+    k4 = 2 * math.ceil(rad / 4) + 1
 
     # 1/4 分辨率扩张：max-pool 下采样保边缘 → 大核 max-pool → 最近邻还原。
     e4 = F.max_pool2d(edge, 4, stride=4)
-    k4 = 2 * math.ceil(rad / 4) + 1
     e4 = F.max_pool2d(e4, k4, stride=1, padding=k4 // 2)
     band = F.interpolate(e4, size=d.shape[-2:], mode="nearest")
+
+    if focus_gate:
+        # 焦邻近门：清晰区（|CoC| 小）同样扩张 rad（清晰物体的渗色传播范围），
+        # 与边缘带相乘 → 只保留"贴近清晰内容"的那部分边缘。
+        focus_px = max(float(pad_px), focus_frac * rad_max)
+        focus = (r_map.abs() < focus_px).to(d.dtype)[None, None]
+        f4 = F.max_pool2d(focus, 4, stride=4)
+        f4 = F.max_pool2d(f4, k4, stride=1, padding=k4 // 2)
+        focus_band = F.interpolate(f4, size=d.shape[-2:], mode="nearest")
+        band = band * focus_band
+
     band = F.avg_pool2d(band, soften, stride=1, padding=soften // 2)
     return band[0].clamp(0.0, 1.0)                         # [1,H,W]
 
