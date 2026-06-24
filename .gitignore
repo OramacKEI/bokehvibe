@@ -37,5 +37,13 @@ checkpoints/
 .DS_Store
 .vscode/
 
+# 内部文档（仅本地/协作者查阅，不对外公开）
+CLAUDE.md
+DECISIONS.md
+GUIDE.md
+NETWORK_DESIGN.md
+PROJECT_STATUS.md
+references.md
+
 # 保留空目录占位
 !**/.gitkeep
