@@ -41,6 +41,21 @@ from __future__ import annotations
 
 
 # ------------------------------------------------------------------------------
+# 光瞳边界软化尺度（apodization）——影响 PSF 盘边缘的锐利度与"衍射亮边环"强弱。
+# ------------------------------------------------------------------------------
+# 物理动机（见 DECISIONS D28）：|FFT{硬边光瞳}|² 是【相干】仿真，会在散景盘的几何
+# 边界处产生一圈高对比的【衍射亮边环】（理想无像差镜头也有，盘边亮度可达内部 1.25×）。
+# 真实相机是【宽光谱 + 部分相干 + 点光源有限角直径 + 光阑叶片非理想硬边】，这圈相干
+# 衍射环被抹掉，理想镜头的散景盘边缘是中性的（不该有亮环——亮环应只由球差 W040 产生）。
+# 光谱平均(psf.SPECTRAL_SAMPLES)能抹平【盘内】菲涅耳环，但抹不掉位于近固定几何半径的
+# 【边缘】环；对光瞳边缘做轻度 apodization（更大的 softness）才是抹掉它的有效手段，
+# 等效于"部分相干/有限源尺寸"的物理平滑。0.04 把理想盘的边缘亮环从 1.25× 压到 ~1.10×，
+# 而球差亮环(肥皂泡 2.4×)/猫眼/多边形等【像差特征】几乎不受影响（它们不在那一圈）。
+# 注意：softness 太大→盘边过糊、多边形角变圆；太小→相干亮边环回来。0.04 是折中。
+DEFAULT_SOFTNESS: float = 0.04
+
+
+# ------------------------------------------------------------------------------
 # 1) 光瞳坐标网格
 # ------------------------------------------------------------------------------
 def make_pupil_grid(size: int, device: str = "cpu", dtype=None):
@@ -94,16 +109,21 @@ def wavefront(grid: dict, H: float, coeffs, channel: int | None = None):
     rho2 = rho * rho
     rho3 = rho2 * rho
     rho4 = rho2 * rho2
+    rho6 = rho4 * rho2
 
     # 离焦基底 + 该通道的 LoCA 偏移（纵向色差：各通道 W020 略不同 → 焦前偏紫/焦后偏绿涌现）
     W020 = coeffs.W020_defocus
+    W040 = coeffs.W040_spherical
     if channel is not None:
         W020 = W020 + coeffs.loca_rgb[channel]
+        # 球色差：各通道球差 W040 偏移 → 盘边亮环强度逐通道不同 → 紫/绿镶边随离焦涌现。
+        W040 = W040 + coeffs.spherochrom_rgb[channel]
 
     H = float(H)
     W = (
         W020 * rho2
-        + coeffs.W040_spherical * rho4
+        + W040 * rho4
+        + coeffs.W060_spherical2 * rho6                 # 高阶球差：盘内带状结构 / 真 nisen（D34）
         + coeffs.W131_coma * H * rho3 * cos_t
         + coeffs.W222_astigmatism * (H ** 2) * rho2 * (cos_t ** 2)
         + coeffs.W220_field_curv * (H ** 2) * rho2
@@ -123,7 +143,7 @@ def _soft_step(value, softness: float):
     return torch.sigmoid(value / softness)
 
 
-def aperture_mask(grid: dict, coeffs, softness: float = 0.02):
+def aperture_mask(grid: dict, coeffs, softness: float = DEFAULT_SOFTNESS):
     """光圈通光遮罩 M_aperture：圆形(n_blades=0) 或 正 n 边形 → 多边形散景。
 
     正 n 边形（外接半径=1，绕中心旋转 blade_rotation）：
@@ -143,13 +163,21 @@ def aperture_mask(grid: dict, coeffs, softness: float = 0.02):
     sector = 2.0 * torch.pi / n
     # 把 θ 折叠到单个扇区中心：wrap ∈ [-sector/2, sector/2]
     wrapped = torch.remainder(theta, sector) - sector / 2.0
-    # 多边形边界半径（外接圆半径取 1）：内切半径 cos(π/n)，沿扇区按 1/cos 张开到顶点。
+    # 直边多边形边界半径（外接圆半径取 1）：内切半径 cos(π/n)，沿扇区按 1/cos 张开到顶点。
     import math
-    r_poly = math.cos(math.pi / n) / torch.cos(wrapped).clamp(min=1e-3)
+    r_straight = math.cos(math.pi / n) / torch.cos(wrapped).clamp(min=1e-3)
+    # 【叶片曲率（blade_curvature∈[0,1]）】真实光圈叶片是弧形→边向外凸、角仍尖。
+    # 向圆(r=1)插值：r = r_straight + c·(1 − r_straight)。角处 r_straight=1→不动(尖角保留)，
+    # 边中 r_straight=cos(π/n)<1→向外凸到 cos+c·(1−cos)；c=1 退化为圆。可微、单调。
+    c = float(getattr(coeffs, "blade_curvature", 0.0))
+    if c > 0.0:
+        r_poly = r_straight + c * (1.0 - r_straight)
+    else:
+        r_poly = r_straight
     return _soft_step(r_poly - rho, softness)
 
 
-def vignette_mask(grid: dict, H: float, coeffs, softness: float = 0.02):
+def vignette_mask(grid: dict, H: float, coeffs, softness: float = DEFAULT_SOFTNESS):
     """口径蚀/猫眼遮罩 M_vignette：随像高 H 平移的第二孔径，与主光瞳取交 → 猫眼。
 
     物理直觉（简化的"双圆相交"模型，与 BokehMe++ K0/K,z_l 的几何同源）：
@@ -174,14 +202,22 @@ def vignette_mask(grid: dict, H: float, coeffs, softness: float = 0.02):
     return _soft_step(R_v ** 2 - dist2, softness)
 
 
-def amplitude(grid: dict, H: float, coeffs, softness: float = 0.02):
-    """光瞳振幅 A = M_aperture · M_vignette。对几何参数可微。"""
+def amplitude(grid: dict, H: float, coeffs, softness: float = DEFAULT_SOFTNESS):
+    """光瞳振幅 A = M_aperture · M_vignette · M_apod。对几何参数可微。
+
+    M_apod = exp(−apodization·ρ²)：变迹（STF/APD）——光瞳透过率随半径平滑衰减，
+    使散景盘边缘柔化无硬边。apodization=0 时该因子≡1（无变迹）。
+    """
     A = aperture_mask(grid, coeffs, softness)
     A = A * vignette_mask(grid, H, coeffs, softness)
+    if coeffs.apodization != 0.0:
+        import torch
+        # 高斯振幅变迹：边缘(ρ=1)透过率 exp(−apod)。apod 越大边缘越暗、盘越"化"。
+        A = A * torch.exp(-coeffs.apodization * grid["rho"] ** 2)
     return A
 
 
-def relative_transmission(grid: dict, H: float, coeffs, softness: float = 0.02):
+def relative_transmission(grid: dict, H: float, coeffs, softness: float = DEFAULT_SOFTNESS):
     """口径蚀导致的【相对透过率】T(H) ∈ (0,1]，对系数可微。
 
     物理动机：PSF 在 psf.py 里被逐个归一化到 sum=1（作为"能量分配核"），
@@ -204,7 +240,7 @@ def relative_transmission(grid: dict, H: float, coeffs, softness: float = 0.02):
 # 4) 组装复光瞳 P = A · exp(i·2π·W)
 # ------------------------------------------------------------------------------
 def complex_pupil(grid: dict, H: float, coeffs, channel: int | None = None,
-                  softness: float = 0.02, phase_scale: float = 1.0):
+                  softness: float = DEFAULT_SOFTNESS, phase_scale: float = 1.0):
     """组装复光瞳，返回 complex 张量。这是 psf.py 做 FFT 的输入。
 
     Args:

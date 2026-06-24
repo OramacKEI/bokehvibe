@@ -127,14 +127,14 @@ def descriptor_table(ctrl, H_centers, device, dtype=None):
     slope, intercept = load_defocus_calibration()
     grid = pupil_mod.make_pupil_grid(ctrl.pupil_size, device=str(device),
                                      dtype=dtype)
-    centers = torch.linspace(0.0, 1.0, ctrl.n_layers)     # 与 layer_weights 同款层中心
-    table = torch.zeros(ctrl.n_layers, len(H_centers), 6,
+    centers = torch.linspace(0.0, 1.0, ctrl.effective_n_layers())     # 与 layer_weights 同款层中心
+    table = torch.zeros(ctrl.effective_n_layers(), len(H_centers), 6,
                         device=device, dtype=dtype or torch.float32)
     with torch.no_grad():
         # T(H) 与离焦无关，每个 H 桶只算一次。
         T_h = [float(pupil_mod.relative_transmission(grid, float(h), ctrl.coeffs))
                for h in H_centers]
-        for l in range(ctrl.n_layers):
+        for l in range(ctrl.effective_n_layers()):
             r_l = signed_coc(float(centers[l]), float(ctrl.focus_disparity),
                              float(ctrl.aperture_K), float(ctrl.focus_tolerance))
             w020 = coc_to_w020(r_l, slope, intercept, ctrl.pupil_size)
@@ -205,7 +205,7 @@ def condition_maps(disparity, ctrl, H_map, az_map, H_centers=None,
         H_centers = [float(H_map.mean())]
     table = descriptor_table(ctrl, H_centers, device=disparity.device,
                              dtype=disparity.dtype)        # [L,nH,6]
-    w_l, _ = layer_weights(disparity, ctrl.n_layers)       # [L,H,W] 离焦轴 tent
+    w_l, _ = layer_weights(disparity, ctrl.effective_n_layers())       # [L,H,W] 离焦轴 tent
     w_h = _tent_weights(H_map, H_centers)                  # [nH,H,W] 像高轴 tent
     # 双轴插值：desc[c] = Σ_l Σ_h table[l,h,c]·w_l·w_h。按 H 桶循环避免大中间张量。
     desc = torch.zeros(6, *disparity.shape, device=disparity.device,
@@ -347,7 +347,7 @@ def _smoke_test():
     r0 = table[:, 0, 0]                                    # H=0 桶的 r_eq 序列
     # r_eq 应随 |离焦| 单调：层中心离 d_f 越远半径越大（两侧分别检查）。
     import numpy as np
-    centers = np.linspace(0, 1, ctrl.n_layers)
+    centers = np.linspace(0, 1, ctrl.effective_n_layers())
     far = r0[centers < 0.8 - 0.05]                          # 背景侧（离焦增大方向为远离）
     assert all(far[i] >= far[i + 1] - 1e-3 for i in range(len(far) - 1)), \
         "r_eq 未随背景侧离焦单调"

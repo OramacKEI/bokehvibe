@@ -66,7 +66,8 @@ def load_config() -> dict:
 # 1) 批数据：在线合成 + 输入侧物理渲染（no_grad）
 # ==============================================================================
 def make_batch(ds, batch_size: int, snap_edges: bool,
-               extra_cond_ch: int = 0, mask_gate: bool = False):
+               extra_cond_ch: int = 0, mask_gate: bool = False,
+               matte_mode: bool = False):
     """取 batch_size 个在线样本，逐个做输入侧物理渲染，堆成批张量。
 
     输入侧管线与真实推理严格一致：扰动视差 →（可选）边缘吸附 → 物理渲染。
@@ -77,14 +78,23 @@ def make_batch(ds, batch_size: int, snap_edges: bool,
     P1b）；mask_gate=True 时附带视差边缘带门控图。两者都从【吸附后的输入视差】
     与样本自带的虚拟画幅几何算出——与推理端 e2e 的口径完全一致。
 
+    Plan B（matte_mode=True，D29）：额外渲染【B_bg】——把边界带视差压到局部背景后
+    重渲（push_band_to_background），该处按背景重度虚化。训练时网络 matte α 在
+    B_fg(=phys) / B_bg 间逐像素选择。matte_mode 下总是计算 band（splice 与 push 都需要），
+    并附带样本的 matte_gt（前景占比真值）。
+
     Returns:
-        (image, disparity, phys, gt, ctrl_vec, cond_maps|None, band|None)
+        (image, disparity, phys, gt, ctrl_vec, cond_maps|None, band|None,
+         bg|None, matte_gt|None)   —— 后两项仅 matte_mode 非 None。
     """
     import torch
     from refine.conditioning import boundary_band, condition_maps
-    from render.renderer import render_field_patch, snap_disparity_edges
+    from render.renderer import (push_band_to_background, render_field_patch,
+                                 snap_disparity_edges)
 
-    imgs, disps, physs, gts, cvecs, conds, bands = [], [], [], [], [], [], []
+    imgs, disps, physs, gts, cvecs = [], [], [], [], []
+    conds, bands, bgs, mattes = [], [], [], []
+    need_band = mask_gate or matte_mode               # matte 的 splice/push 也要 band
     for _ in range(batch_size):
         s = ds[0]                                   # 在线数据集：每次调用都是新样本
         m = s["meta"]
@@ -101,8 +111,17 @@ def make_batch(ds, batch_size: int, snap_edges: bool,
                     disp, m["ctrl"], m["H_map"], m["az_map"],
                     H_centers=m["H_centers"],
                     with_descriptors=(extra_cond_ch == 9)))
-            if mask_gate:
-                bands.append(boundary_band(disp, m["ctrl"]))
+            band = boundary_band(disp, m["ctrl"]) if need_band else None
+            if need_band:
+                bands.append(band)
+            if matte_mode:
+                disp_bg = push_band_to_background(disp, m["ctrl"], band=band)
+                bg = render_field_patch(s["image"], disp_bg, m["ctrl"],
+                                        m["H_field"], m["azimuth"],
+                                        H_centers=m["H_centers"],
+                                        H_weights=m["H_weights"])
+                bgs.append(bg.clamp(0.0, 1.0))
+                mattes.append(s["matte_gt"])
         imgs.append(s["image"])
         disps.append(disp)
         physs.append(phys.clamp(0.0, 1.0))
@@ -111,7 +130,33 @@ def make_batch(ds, batch_size: int, snap_edges: bool,
     return (torch.stack(imgs), torch.stack(disps), torch.stack(physs),
             torch.stack(gts), torch.stack(cvecs),
             torch.stack(conds) if conds else None,
-            torch.stack(bands) if bands else None)
+            torch.stack(bands) if bands else None,
+            torch.stack(bgs) if bgs else None,
+            torch.stack(mattes) if mattes else None)
+
+
+# ==============================================================================
+# 1.5) 细化网前向 + 输出装配（v1 融合式 / Plan B matte 选择式，统一入口）
+# ==============================================================================
+def refine_forward(net, img, disp, phys, cvec, cond, band, bg, matte_mode: bool):
+    """跑细化网并装配最终散景 B；返回 (B, aux)。
+
+    v1 融合式：B = m·B_neural + (1−m)·B_phys，aux={"map": m}（误差图）。
+    Plan B matte 式（D29）：网络出 raw matte α（不经门控，门控由 splice 承担）→
+        B = band·(α·B_fg + (1−α)·B_bg) + (1−band)·B_phys
+        —— 带内两张物理渲染按 α 选择、带外恒为 B_phys；找补结构上不可能。
+        aux={"map": α}（matte，复用 error_mask 接口位）。
+    """
+    if matte_mode:
+        out = net(img, disp, phys, cvec, cond_maps=cond, mask_gate=None)
+        alpha = out["matte"]                          # raw α∈[0,1]（门控由 band splice 承担）
+        B_band = alpha * phys + (1.0 - alpha) * bg
+        B = band * B_band + (1.0 - band) * phys
+        # logit 一并返回：matte 损失走 BCE-on-logits（饱和处梯度不消失，避免 α 一旦
+        # 被 recon 压到 0 就被 L1·σ' 的消失梯度永久卡死，见 train_probe_matte 实证）。
+        return B, {"map": alpha, "logit": out["matte_logit"]}
+    out = net(img, disp, phys, cvec, cond_maps=cond, mask_gate=band)
+    return out["bokeh"], {"map": out["error_mask"], "neural": out["bokeh_neural"]}
 
 
 # ==============================================================================
@@ -136,8 +181,9 @@ def build_perceptual(device: str):
 # ==============================================================================
 # 3) 评测：边界区域 L1（细化网净收益的关键指标）
 # ==============================================================================
-def evaluate_boundary(net, val_samples, mask_gain: float = 10.0):
-    """在固定验证样本上量化"边界区域"的 L1：phys vs fused。
+def evaluate_boundary(net, val_samples, mask_gain: float = 10.0,
+                      matte_mode: bool = False):
+    """在固定验证样本上量化"边界区域"的 L1：phys vs refined。
 
     为什么不用全图 L1：边界高误差区只占 ~8% 像素，全图 L1 被平坦区主导，
     细化网的收益在第 4 位小数里看不见。这里只统计 m_gt>0.2 的像素。
@@ -147,12 +193,14 @@ def evaluate_boundary(net, val_samples, mask_gain: float = 10.0):
     bp = bf = npx = 0.0
     gp = gf = 0.0
     with torch.no_grad():
-        for img, disp, phys, gt, cvec, cond, band in val_samples:
-            out = net(img[None], disp[None], phys[None], cvec[None],
-                      cond_maps=None if cond is None else cond[None],
-                      mask_gate=None if band is None else band[None])
+        for img, disp, phys, gt, cvec, cond, band, bg, _mgt in val_samples:
+            B, _ = refine_forward(
+                net, img[None], disp[None], phys[None], cvec[None],
+                None if cond is None else cond[None],
+                None if band is None else band[None],
+                None if bg is None else bg[None], matte_mode)
             ep = (phys[None] - gt[None]).abs().mean(1)        # [1,H,W]
-            ef = (out["bokeh"] - gt[None]).abs().mean(1)
+            ef = (B - gt[None]).abs().mean(1)
             sel = (mask_gain * ep).clamp(0, 1) > 0.2
             bp += float(ep[sel].sum())
             bf += float(ef[sel].sum())
@@ -169,8 +217,9 @@ def evaluate_boundary(net, val_samples, mask_gain: float = 10.0):
 # ==============================================================================
 # 4) 可视化：物理 vs 细化 vs GT（训练中/结束时的人工核对窗口）
 # ==============================================================================
-def save_visualization(net, val_samples, path: Path, device: str):
-    """对固定验证样本出对比面板：B_phys / B / GT / 误差图 / 两者的 |diff×4|。"""
+def save_visualization(net, val_samples, path: Path, device: str,
+                       matte_mode: bool = False):
+    """对固定验证样本出对比面板：B_phys / B / GT / map(误差图或 matte) / 两者的 |diff×4|。"""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -180,16 +229,19 @@ def save_visualization(net, val_samples, path: Path, device: str):
     n = len(val_samples)
     fig, axes = plt.subplots(n, 6, figsize=(20, 3.5 * n), squeeze=False)
     with torch.no_grad():
-        for i, (img, disp, phys, gt, cvec, cond, band) in enumerate(val_samples):
-            out = net(img[None], disp[None], phys[None], cvec[None],
-                      cond_maps=None if cond is None else cond[None],
-                      mask_gate=None if band is None else band[None])
-            B = out["bokeh"][0]
+        for i, (img, disp, phys, gt, cvec, cond, band, bg, _mgt) in enumerate(val_samples):
+            B, aux = refine_forward(
+                net, img[None], disp[None], phys[None], cvec[None],
+                None if cond is None else cond[None],
+                None if band is None else band[None],
+                None if bg is None else bg[None], matte_mode)
+            B = B[0]
+            map_name = "matte alpha" if matte_mode else "error mask m"
             panels = [
                 ("B_phys (renderer)", phys, None),
-                ("B refined (fused)", B, None),
+                ("B refined", B, None),
                 ("bokeh GT", gt, None),
-                ("error mask m", out["error_mask"][0, 0], "mask"),
+                (map_name, aux["map"][0, 0], "mask"),
                 ("|B_phys-GT|x4", (phys - gt).abs().mean(0) * 4, "diff"),
                 ("|B-GT|x4", (B - gt).abs().mean(0) * 4, "diff"),
             ]
@@ -237,6 +289,23 @@ def main(argv=None):
                     default=float(tr.get("boundary_weight", 4.0)),
                     help="重建损失的逐像素权重 1+bw·m_gt：边界只占 ~8% 像素，"
                          "不加权时边界梯度被平坦区稀释 ~12 倍")
+    ap.add_argument("--lambda-matte", type=float,
+                    default=float(tr.get("lambda_matte", 0.3)),
+                    help="Plan B：matte 直监 L1(α, α_gt) 带内权重（D29）")
+    ap.add_argument("--matte", dest="matte", action="store_true", default=None,
+                    help="强制 Plan B matte 选择式重渲（覆盖 config）")
+    ap.add_argument("--no-matte", dest="matte", action="store_false",
+                    help="强制 v1 误差图融合式（消融基线）")
+    ap.add_argument("--block", choices=["film_res", "naf"], default=None,
+                    help="残差块类型（P2a，D32）：film_res=v1 plain conv×2；"
+                         "naf=NAFNet 块（depthwise+SimpleGate+SCA）。覆盖 config")
+    ap.add_argument("--ar-mid", type=int, default=None,
+                    help="ARNet 通道宽（naf 同参对照建议 144；默认 config 96）")
+    ap.add_argument("--iu-mid", type=int, default=None,
+                    help="IUNet 通道宽（naf 同参对照建议 72；默认 config 48）")
+    ap.add_argument("--amp", action="store_true", default=False,
+                    help="混合精度训练（fp16 网络前向+损失，fp32 物理 PSF）。"
+                         "RTX 30xx/40xx/50xx Tensor Core 可显著提速（~30-50%%）")
     ap.add_argument("--no-perceptual", action="store_true")
     ap.add_argument("--bg-dirs", type=str, nargs="+", default=None,
                     help="背景图目录（可多个）。不传则用 SynthConfig 默认的占位池；"
@@ -266,8 +335,16 @@ def main(argv=None):
     psf_desc = bool(rf.get("psf_desc", False)) and spatial   # 描述子依赖空间图
     extra_cond_ch = (9 if psf_desc else 3) if spatial else 0
     gate = bool(rf.get("mask_edge_gate", False))
+    matte_mode = bool(rf.get("matte_mode", False)) if args.matte is None else args.matte
+    # P2a（D32）：残差块类型与宽度。block 'naf' 在同 ch 下约半参，故配 naf 时默认
+    # 加宽 ar_mid/iu_mid 到与 film_res 同预算（~707k），做"同参数换块"的公平对照。
+    block_type = args.block if args.block is not None else str(rf.get("block_type", "film_res"))
+    ar_mid = args.ar_mid if args.ar_mid is not None else int(rf.get("ar_mid", 96))
+    iu_mid = args.iu_mid if args.iu_mid is not None else int(rf.get("iu_mid", 48))
     print(f"[train] P1 条件：spatial_cond={spatial} psf_desc={psf_desc} "
-          f"(extra_cond_ch={extra_cond_ch})  mask_edge_gate={gate}")
+          f"(extra_cond_ch={extra_cond_ch})  mask_edge_gate={gate}  "
+          f"matte_mode={matte_mode}（Plan B 选择式重渲）  "
+          f"block={block_type} ar_mid={ar_mid} iu_mid={iu_mid}", flush=True)
 
     # ---- 数据：在线合成（训练流 + 4 个固定验证样本）----
     snap = bool(cfg["depth"].get("snap_edges", True))
@@ -276,16 +353,17 @@ def main(argv=None):
         synth_kw["bg_dirs"] = args.bg_dirs                # 训练/验证共用同一背景池
     ds = SynthBokehDataset(SynthConfig(seed=args.seed, **synth_kw))
     val_ds = SynthBokehDataset(SynthConfig(seed=123, **synth_kw))  # 固定种子=固定验证集
-    print(f"[train] 背景池 {len(ds.bg_pool.paths):,} 张图")
+    print(f"[train] 背景池 {len(ds.bg_pool.paths):,} 张图", flush=True)
     # 4 个固定验证样本（训练全程不变，便于跨 checkpoint 对比同一画面）。
     val_samples = []
     for _ in range(4):
-        b = make_batch(val_ds, 1, snap, extra_cond_ch, gate)  # 批张量 (batch=1)
+        b = make_batch(val_ds, 1, snap, extra_cond_ch, gate, matte_mode)  # batch=1
         val_samples.append(tuple(None if t is None else t[0] for t in b))
 
     # ---- 网络 / 优化器 / 损失 ----
     net = RefineNet(cond_dim=int(cfg["refine"]["cond_dim"]),
-                    extra_cond_ch=extra_cond_ch).to(device)
+                    extra_cond_ch=extra_cond_ch, matte_mode=matte_mode,
+                    block_type=block_type, ar_mid=ar_mid, iu_mid=iu_mid).to(device)
     n_params = count_parameters(net)
     assert n_params < int(cfg["refine"]["max_params_million"] * 1e6), \
         f"参数量 {n_params:,} 超出轻量铁律！"
@@ -299,74 +377,103 @@ def main(argv=None):
         net.load_state_dict(ck["model"])
         opt.load_state_dict(ck["optimizer"])
         it0 = int(ck["iter"])
-        print(f"[train] 从 {args.resume} 续训（已完成 {it0} 步）")
+        print(f"[train] 从 {args.resume} 续训（已完成 {it0} 步）", flush=True)
 
+    # AMP：GradScaler 只在 CUDA+amp 下启用；CPU / no-amp 走 None 分支。
+    scaler = torch.amp.GradScaler("cuda") if (args.amp and device == "cuda") else None
     print(f"[train] device={device} params={n_params:,} batch={args.batch} "
           f"crop={args.crop} lr={args.lr} iters={args.iters} "
-          f"perceptual={'LPIPS-VGG' if perc else 'off'} snap_edges={snap}")
+          f"perceptual={'LPIPS-VGG' if perc else 'off'} snap_edges={snap} "
+          f"amp={'on' if scaler else 'off'}", flush=True)
 
     # ---- 循环 ----
     net.train()
     history = []                                     # (iter, l1, perc, l1_phys)
     t0 = time.time()
     for it in range(it0 + 1, args.iters + 1):
-        img, disp, phys, gt, cvec, cond, band = make_batch(
-            ds, args.batch, snap, extra_cond_ch, gate)
-        out = net(img, disp, phys, cvec, cond_maps=cond, mask_gate=band)
-        # 误差图 GT：m_gt = 物理渲染的真实误差（边界≈1、平坦区≈0）。
-        # phys/gt 都不带梯度，m_gt 是常量目标；它同时充当重建损失的边界权重。
-        m_gt = (args.mask_gain
-                * (phys - gt).abs().mean(dim=1, keepdim=True)).clamp(0.0, 1.0)
-        # 边界加权 L1：权重 1+bw·m_gt，除以权重均值保持量纲（与普通 L1 可比）。
-        w = 1.0 + args.boundary_weight * m_gt
-        loss_l1 = ((out["bokeh"] - gt).abs() * w).mean() / w.mean()
-        loss_p = torch.zeros((), device=device)
-        if perc is not None:
-            # LPIPS 期望 [-1,1]；normalize=True 让它自己从 [0,1] 换算。
-            loss_p = perc(out["bokeh"].clamp(0, 1), gt,
-                          normalize=True).mean()
-        # 神经分支直接监督：不经 mask 门控，保证 mask≈0 处神经分支照样有梯度。
-        loss_n = ((out["bokeh_neural"] - gt).abs() * w).mean() / w.mean()
-        # 误差图显式监督。边界带门控开启时目标同乘 band：带外 m 被结构性置 0
-        # （sigmoid·band 在 band=0 处无梯度），不裁掉目标会留下永远不可优化的
-        # 常数损失项（典型来源：视差完全漏检的细丝，phys≠GT 但无边缘证据）。
-        loss_m = l1(out["error_mask"], m_gt if band is None else m_gt * band)
-        loss = (loss_l1 + args.lambda_perc * loss_p
-                + args.lambda_neural * loss_n + args.lambda_mask * loss_m)
+        # make_batch 在 autocast 外：物理 PSF/FFT 需要 fp32 精度。
+        img, disp, phys, gt, cvec, cond, band, bg, matte_gt = make_batch(
+            ds, args.batch, snap, extra_cond_ch, gate, matte_mode)
+
+        # 网络前向 + 损失：可 fp16（autocast 自动管理精度）。
+        with torch.amp.autocast("cuda", enabled=(scaler is not None)):
+            B, aux = refine_forward(net, img, disp, phys, cvec, cond, band, bg,
+                                    matte_mode)
+            # 误差图/边界权重 GT：m_gt = 物理渲染的真实误差（边界≈1、平坦区≈0）。
+            m_gt = (args.mask_gain
+                    * (phys - gt).abs().mean(dim=1, keepdim=True)).clamp(0.0, 1.0)
+            # 边界加权 L1：权重 1+bw·m_gt，除以权重均值保持量纲（与普通 L1 可比）。
+            w = 1.0 + args.boundary_weight * m_gt
+            loss_l1 = ((B - gt).abs() * w).mean() / w.mean()
+            loss_p = torch.zeros((), device=device)
+            if perc is not None:
+                # LPIPS 期望 [-1,1]；normalize=True 让它自己从 [0,1] 换算。
+                loss_p = perc(B.clamp(0, 1), gt, normalize=True).mean()
+
+            if matte_mode:
+                # Plan B：matte 直监 BCE-on-logits（D29/D30）。
+                import torch.nn.functional as F
+                loss_n = torch.zeros((), device=device)
+                bm = band
+                bce = F.binary_cross_entropy_with_logits(
+                    aux["logit"], matte_gt, reduction="none")
+                loss_m = (bce * bm).sum() / bm.sum().clamp(min=1.0)
+                loss = (loss_l1 + args.lambda_perc * loss_p
+                        + args.lambda_matte * loss_m)
+                map_mean = float((aux["map"] * bm).sum().detach()
+                                 / bm.sum().clamp(min=1.0))
+            else:
+                loss_n = ((aux["neural"] - gt).abs() * w).mean() / w.mean()
+                loss_m = l1(aux["map"], m_gt if band is None else m_gt * band)
+                loss = (loss_l1 + args.lambda_perc * loss_p
+                        + args.lambda_neural * loss_n + args.lambda_mask * loss_m)
+                map_mean = float(aux["map"].mean().detach())
+
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)  # 防偶发大梯度
-        opt.step()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step()
 
         with torch.no_grad():
             l1_phys = float(l1(phys, gt))            # 物理渲染基线（诊断用）
-        history.append((it, float(loss_l1), float(loss_p), l1_phys,
-                        float(loss_n), float(loss_m),
-                        float(out["error_mask"].mean())))
+        history.append((it, float(loss_l1.detach()), float(loss_p.detach()),
+                        l1_phys, float(loss_n.detach()), float(loss_m.detach()),
+                        map_mean))
 
         if it % args.log_every == 0 or it == it0 + 1:
             dt = (time.time() - t0) / (it - it0)     # 只按本次会话的步数计速
             mem = (torch.cuda.max_memory_allocated() / 2**30
                    if device == "cuda" else 0.0)
-            print(f"[train] it {it:6d}/{args.iters}  L1={float(loss_l1):.4f} "
-                  f"(phys基线={l1_phys:.4f})  LPIPS={float(loss_p):.4f}  "
-                  f"L1n={float(loss_n):.4f}  Lm={float(loss_m):.4f} "
-                  f"m̄={float(out['error_mask'].mean()):.3f}  "
-                  f"{dt:.2f}s/it  峰值显存 {mem:.1f}GB")
+            mname = "ᾱ" if matte_mode else "m̄"     # matte 均值 / 误差图均值
+            print(f"[train] it {it:6d}/{args.iters}  L1={loss_l1.detach().item():.4f} "
+                  f"(phys基线={l1_phys:.4f})  LPIPS={loss_p.detach().item():.4f}  "
+                  f"L1n={loss_n.detach().item():.4f}  Lm={loss_m.detach().item():.4f} "
+                  f"{mname}={map_mean:.3f}  "
+                  f"{dt:.2f}s/it  峰值显存 {mem:.1f}GB", flush=True)
         if it % args.viz_every == 0:
             save_visualization(net, val_samples,
-                               out_dir / f"viz_it{it:06d}.png", device)
-            ev = evaluate_boundary(net, val_samples, args.mask_gain)
+                               out_dir / f"viz_it{it:06d}.png", device, matte_mode)
+            ev = evaluate_boundary(net, val_samples, args.mask_gain, matte_mode)
             print(f"[eval]  it {it:6d}  边界L1: phys={ev['boundary_phys']:.4f} "
-                  f"fused={ev['boundary_fused']:.4f} "
-                  f"(差值 {ev['boundary_fused'] - ev['boundary_phys']:+.4f}，负=净收益)")
+                  f"refined={ev['boundary_fused']:.4f} "
+                  f"(差值 {ev['boundary_fused'] - ev['boundary_phys']:+.4f}，负=净收益)",
+                  flush=True)
         if it % args.save_every == 0 or it == args.iters:
             torch.save({"iter": it, "model": net.state_dict(),
                         "optimizer": opt.state_dict(),
                         "args": vars(args), "n_params": n_params,
-                        # P1 架构标记：e2e 推理按此选择整图单前向(v2)或滑窗(v1)。
+                        # 架构标记：e2e 推理按此选择 matte 选择式 / v2 整图 / v1 滑窗，
+                        # 并按 block/宽度重建网络（P2a，D32）。
                         "extra_cond_ch": extra_cond_ch,
-                        "mask_edge_gate": gate},
+                        "mask_edge_gate": gate, "matte_mode": matte_mode,
+                        "block_type": block_type, "ar_mid": ar_mid, "iu_mid": iu_mid},
                        out_dir / "ckpt_latest.pth")
 
     # ---- 收尾：损失曲线 + 历史落盘 ----
@@ -378,8 +485,9 @@ def main(argv=None):
     # 图内文字用英文（Agg 默认字体无 CJK 字形，中文会变成方框+刷屏警告）。
     ax.plot(its, l1s, label="L1(B, GT)")
     ax.plot(its, l1ph, label="L1(B_phys, GT) physical baseline", ls="--", alpha=0.7)
-    ax.plot(its, l1ns, label="L1(B_neural, GT)", alpha=0.5)
-    ax.plot(its, lms, label="mask loss", alpha=0.5)
+    if not matte_mode:
+        ax.plot(its, l1ns, label="L1(B_neural, GT)", alpha=0.5)
+    ax.plot(its, lms, label="matte loss" if matte_mode else "mask loss", alpha=0.5)
     if perc is not None:
         ax.plot(its, ps, label="LPIPS(B, GT)", alpha=0.7)
     ax.set_xlabel("iteration")
@@ -389,15 +497,15 @@ def main(argv=None):
     fig.tight_layout()
     fig.savefig(str(out_dir / "loss_curve.png"), dpi=100)
     plt.close(fig)
-    ev = evaluate_boundary(net, val_samples, args.mask_gain)
+    ev = evaluate_boundary(net, val_samples, args.mask_gain, matte_mode)
     print(f"[eval]  最终边界L1: phys={ev['boundary_phys']:.4f} "
           f"fused={ev['boundary_fused']:.4f} "
-          f"(差值 {ev['boundary_fused'] - ev['boundary_phys']:+.4f}，负=净收益)")
+          f"(差值 {ev['boundary_fused'] - ev['boundary_phys']:+.4f}，负=净收益)", flush=True)
     (out_dir / "history.json").write_text(json.dumps(
         {"columns": ["iter", "l1", "lpips", "l1_phys", "l1_neural",
                      "mask_loss", "mask_mean"], "rows": history,
          "final_eval": ev}))
-    print(f"[train] 完成。checkpoint/曲线/可视化 -> {out_dir}")
+    print(f"[train] 完成。checkpoint/曲线/可视化 -> {out_dir}", flush=True)
 
 
 if __name__ == "__main__":

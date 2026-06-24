@@ -25,7 +25,9 @@ Depth Anything V2 的原始输出恰好就是"仿射不变的逆深度"，即视
         infer_disparity(image) -> np.ndarray   # 归一化视差 [0,1]，近=1 远=0
 管线其余部分只依赖这个接口，不关心底层是哪个模型。
 
-- 默认后端：`DepthAnythingV2Backend`（DA V2-Small / vits，25M，Apache-2.0，已落地可跑）。
+- 默认后端：`DepthAnythingV2Backend`（默认 **DA V2-Large / vitl，335M，input_size=770**，
+  边界/细结构质量明显优于 Base/Small，D37；冻结仅推理、不算可训练参数。
+  encoder='vitb'(Base) / 'vits'(Small/Apache-2.0) 可切回）。
 - 备选后端：`DepthAnything3Backend`（DA3，占位 stub）。DA3 更强但更重（Small 80M / Mono-Large
   350M），定位偏多视图几何、输出是 depth-ray 表示，需额外转换；仅当边界质量成为瓶颈时再考虑，
   详见该类的说明。
@@ -51,10 +53,19 @@ import numpy as np  # numpy 在 base 环境就有，安全；torch/cv2 则惰性
 _THIS_FILE = Path(__file__).resolve()
 PROJECT_ROOT = _THIS_FILE.parent.parent                       # /home/jing/bokeh
 DA_V2_REPO = PROJECT_ROOT / "third_party" / "Depth-Anything-V2"
-DA_V2_CKPT = PROJECT_ROOT / "checkpoints" / "depth_anything_v2_vits.pth"
+
+
+def _da_v2_ckpt(encoder: str) -> Path:
+    """编码器档位 → 权重文件路径（checkpoints/depth_anything_v2_{encoder}.pth）。"""
+    return PROJECT_ROOT / "checkpoints" / f"depth_anything_v2_{encoder}.pth"
+
+
+DA_V2_CKPT = _da_v2_ckpt("vits")     # 向后兼容旧名（Small 权重路径）
 
 # DA V2 各编码器(encoder)对应的网络结构超参（取自上游 run.py）。
-# 本项目只用 'vits'(=Small)：唯一 Apache-2.0、最轻量(25M)、冻结仅推理。
+# 默认 'vitb'(=Base,97M)：推理深度的全局关系/主体内部均匀性明显优于 Small（D25，
+# 真实图核图实测）；冻结仅推理、不算可训练参数 → 不碰 RQ2 轻量性。
+# 许可：'vits'=Apache-2.0；'vitb'/'vitl'=CC-BY-NC-4.0（学术非商用可用，论文须声明）。
 _DA_V2_CONFIGS = {
     "vits": {"encoder": "vits", "features": 64, "out_channels": [48, 96, 192, 384]},
     "vitb": {"encoder": "vitb", "features": 128, "out_channels": [96, 192, 384, 768]},
@@ -73,18 +84,24 @@ def _pick_device(device: str | None) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _normalize_to_disparity01(raw: "np.ndarray") -> "np.ndarray":
+def _normalize_to_disparity01(raw: "np.ndarray", clip_pct: float = 0.5) -> "np.ndarray":
     """把后端的原始输出线性归一化到 [0,1]，语义=视差(近=1, 远=0)。
 
-    DA V2 原始输出是仿射不变逆深度(值越大越近)，做 min-max 归一化后：
-        最近处 ≈ 1.0，最远处 ≈ 0.0  —— 正好是 CoC 公式需要的视差方向。
+    DA V2 原始输出是仿射不变逆深度(值越大越近)，归一化后最近≈1、最远≈0。
+
+    【为何用百分位而非裸 min/max】裸 min-max 对【离群像素】敏感：一个极近的反光点
+    或一个极远的天空像素会独占 0/1 端，把其余内容压到很窄的区间 → 视差尺度不稳，
+    而 CoC 公式 r=K·|D−d_f| 依赖绝对视差尺度 → 同一物理深度的虚化量在不同图间漂移。
+    改用 [clip_pct, 100−clip_pct] 百分位定标定范围、再裁剪到 [0,1]：对离群稳健，
+    尺度一致（与 auto_focus_params 用百分位算 d_f/K/tol 的口径也更自洽）。
     """
     raw = raw.astype(np.float32)
-    lo, hi = float(raw.min()), float(raw.max())
+    lo = float(np.percentile(raw, clip_pct))
+    hi = float(np.percentile(raw, 100.0 - clip_pct))
     if hi - lo < 1e-8:
-        # 退化情形（全图同值），返回全 0，避免除零。
+        # 退化情形（全图近同值），返回全 0，避免除零。
         return np.zeros_like(raw)
-    return (raw - lo) / (hi - lo)
+    return np.clip((raw - lo) / (hi - lo), 0.0, 1.0)
 
 
 # ==============================================================================
@@ -106,13 +123,13 @@ class DepthBackend:
 
 
 # ==============================================================================
-# 默认后端：Depth Anything V2-Small (vits)。已落地、可直接跑。
+# 默认后端：Depth Anything V2-Large (vitl)。encoder='vitb'/'vits' 切回 Base/Small。
 # ==============================================================================
 class DepthAnythingV2Backend(DepthBackend):
-    """封装冻结的 DA V2-Small 推理。
+    """封装冻结的 DA V2 推理（默认 Large/vitl）。
 
     用法：
-        backend = DepthAnythingV2Backend()          # 加载一次，反复调用
+        backend = DepthAnythingV2Backend()          # 默认 Large/vitl；加载一次反复调用
         disp = backend.infer_disparity("a.jpg")     # -> (H,W) float32, [0,1], 近=1
     """
 
@@ -120,7 +137,7 @@ class DepthAnythingV2Backend(DepthBackend):
 
     def __init__(
         self,
-        encoder: str = "vits",
+        encoder: str = "vitl",
         device: str | None = None,
         ckpt_path: str | Path | None = None,
     ) -> None:
@@ -139,14 +156,16 @@ class DepthAnythingV2Backend(DepthBackend):
         from depth_anything_v2.dpt import DepthAnythingV2  # 来自 third_party/Depth-Anything-V2
 
         if encoder not in _DA_V2_CONFIGS:
-            raise ValueError(f"不支持的 encoder: {encoder}；本项目固定用 'vits'(Small)")
+            raise ValueError(
+                f"不支持的 encoder: {encoder}；可选 'vits'(Small)/'vitb'(Base)/'vitl'(Large)")
 
-        # ---- 构建网络并载入权重 ----
-        ckpt = Path(ckpt_path) if ckpt_path is not None else DA_V2_CKPT
+        # ---- 构建网络并载入权重（ckpt_path 未指定时按 encoder 自动选档）----
+        ckpt = Path(ckpt_path) if ckpt_path is not None else _da_v2_ckpt(encoder)
         if not ckpt.exists():
             raise FileNotFoundError(
                 f"找不到 DA V2 权重：{ckpt}\n"
-                f"请先下载 Small 权重到该路径（见 PROJECT_STATUS.md）。"
+                f"请先下载 {encoder} 权重到该路径"
+                f"（HuggingFace depth-anything/Depth-Anything-V2-*，见 PROJECT_STATUS.md）。"
             )
 
         self.model = DepthAnythingV2(**_DA_V2_CONFIGS[encoder])
@@ -181,12 +200,14 @@ class DepthAnythingV2Backend(DepthBackend):
             return image[:, :, ::-1].copy()
         raise TypeError(f"不支持的输入类型：{type(image)}")
 
-    def infer_disparity(self, image: ImageInput, input_size: int = 518) -> "np.ndarray":
+    def infer_disparity(self, image: ImageInput, input_size: int = 770) -> "np.ndarray":
         """I -> 归一化视差 D ∈ [0,1]（近=1, 远=0）。已在 no_grad 下推理。
 
         Args:
             image: 图片路径，或 RGB 的 (H,W,3) uint8 numpy 图。
-            input_size: DA V2 内部 resize 的短边目标（须为 14 的倍数，默认 518，官方推荐值）。
+            input_size: DA V2 内部 resize 的短边目标（须为 14 的倍数）。**默认 770**（>官方 518）：
+                散景对【边界/细结构】敏感，更高 input_size 让烟囱/树/细枝等深度更细（D37 实测
+                Large@768 明显优于 Base@518）。代价：CPU 略慢（~10s vs 1s），GPU 几无感。
 
         Returns:
             (H, W) float32，取值 [0,1]，与输入同分辨率。语义=视差，可直接喂 CoC 公式。
@@ -260,12 +281,13 @@ def infer_disparity(image: ImageInput, backend: DepthBackend | None = None) -> "
 
 
 # ==============================================================================
-# 最小可视化：把视差存成伪彩图，供人工核对方向/质量（CLAUDE.md 第 12 节）。
+# 最小可视化：把视差存成灰度图，供人工核对方向/质量（CLAUDE.md 第 12 节）。
 # ==============================================================================
 def save_disparity_visualization(disparity: "np.ndarray", out_path: str | Path) -> None:
-    """把 [0,1] 视差图存成伪彩 PNG（近处暖/亮，远处冷/暗），便于肉眼检查。
+    """把 [0,1] 视差图存成灰度 PNG（近处亮/白，远处暗/黑），便于肉眼检查。
 
-    用 matplotlib 的 'Spectral_r' 配色（与 DA V2 官方可视化一致），并标注语义提醒。
+    用 matplotlib 的 'gray' 配色——与多数散景论文（及 DA V2 的 `--grayscale` 选项）一致，
+    避免发散型彩虹配色(Spectral)误导深度断层/单调顺序的判断。near=1 → 白。
     """
     import matplotlib
     matplotlib.use("Agg")  # 无显示环境(服务器/tty)下也能存图
@@ -275,9 +297,9 @@ def save_disparity_visualization(disparity: "np.ndarray", out_path: str | Path) 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     plt.figure(figsize=(8, 6))
-    plt.imshow(disparity, cmap="Spectral_r", vmin=0.0, vmax=1.0)
+    plt.imshow(disparity, cmap="gray", vmin=0.0, vmax=1.0)
     plt.colorbar(label="disparity  (near=1, far=0)")
-    plt.title("Depth Anything V2-Small  视差图（务必核对：近处应更亮）")
+    plt.title("Depth Anything V2  (check: near regions should be brighter)")
     plt.axis("off")
     plt.tight_layout()
     plt.savefig(str(out_path), dpi=120, bbox_inches="tight")
@@ -301,7 +323,7 @@ if __name__ == "__main__":
             sys.exit(1)
         img_path = str(examples[0])
 
-    print(f"[depth] 加载 DA V2-Small 后端 ...")
+    print(f"[depth] 加载 DA V2 后端（默认 Large/vitl）...")
     backend = load_depth_backend("depth_anything_v2")
     print(f"[depth] device = {backend.device}，推理图片：{img_path}")
     disp = backend.infer_disparity(img_path)

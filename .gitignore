@@ -5,14 +5,31 @@ __pycache__/
 .ipynb_checkpoints/
 
 # 大文件 / 不入库的数据与权重
-refs/*.pdf            # 参考论文 PDF（本地副本，勿入库）
-outputs/              # checkpoint、可视化、日志
-data/datasets/        # RealBokeh / EBB! 等真实数据集
-third_party/          # 上游仓库 BokehMe / Depth-Anything-V2（各自有 git，不嵌套入库）
-checkpoints/          # 下载的预训练权重（DA V2-Small 等）
+# 注意：git 不支持行内注释，规则与说明必须分行写
+
+# 参考论文 PDF（本地副本，勿入库）
+refs/*.pdf
+
+# checkpoint、可视化、日志、训练产物
+outputs/
+
+# 演示/测试用图片资源
+assets/
+
+# RealBokeh / EBB! 等真实数据集
+data/datasets/
+
+# 上游仓库 BokehMe / Depth-Anything-V2（各自有 git，不嵌套入库）
+third_party/
+
+# 下载的预训练权重
+checkpoints/
 *.ckpt
 *.pth
 *.pt
+
+# 日志文件
+*.log
 
 # 环境与编辑器
 .venv/

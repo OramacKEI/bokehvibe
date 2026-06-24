@@ -329,6 +329,7 @@ def make_sample(cfg: SynthConfig, bg_pool: BackgroundPool, rng):
         disparity    [S,S]    【加扰动】视差（网络输入侧用这个！）
         disparity_gt [S,S]    真视差（调试/消融用，训练不喂网）
         bokeh_gt     [3,S,S]  散景 GT（已知 alpha 精确分层合成，sRGB）
+        matte_gt     [1,S,S]  边界带前景占比真值 α_gt（Plan B matte 头监督，D29）
         ctrl_vec     [13]     控制向量数值表示（FiLM 条件注入细化网，D15 后 13 维）
         meta         dict     采样到的对象（ctrl/H_field/azimuth/层视差）
     """
@@ -347,7 +348,21 @@ def make_sample(cfg: SynthConfig, bg_pool: BackgroundPool, rng):
     bg_disp = float(rng.uniform(*cfg.bg_disp_range))
     layers = [(bg_rgb, torch.ones(1, S, S, device=dev), bg_disp)]
 
+    # ---- 背景细薄结构层（找补根因修正，D23）----
+    # 在背景侧（视差 ≤ bg_disp，更远）插入细薄层；下方强制对焦前景使其重度虚化，
+    # GT 也虚化 → 网络学到"背景细薄结构保持虚化"，纠正"细薄→锐化"的泛化偏差。
+    # 合成顺序：先于前景 append，全焦图 over 合成时前景正确遮挡背景细薄层
+    # （composite_blurred_layers 内部按视差排序，遮挡天然正确）。
+    add_bg_thin = rng.uniform() < cfg.p_thin_bg
+    if add_bg_thin:
+        for _ in range(int(rng.integers(*cfg.n_bg_thin_range, endpoint=True))):
+            d_bgt = float(rng.uniform(0.0, bg_disp))      # 背景侧、≤ 背景视差（更远）
+            layers.append((_random_texture(S, rng, dev),
+                           _random_thin_alpha(S, rng, dev), d_bgt))
+
     n_fg = int(rng.integers(cfg.n_fg_range[0], cfg.n_fg_range[1] + 1))
+    if add_bg_thin:
+        n_fg = max(n_fg, 1)                               # 需有前景层作对焦目标
     fg_disps = sorted(rng.uniform(*cfg.fg_disp_range, size=n_fg).tolist())
     for d_fg in fg_disps:
         # 细薄结构（枝/草/栅栏）与光滑 blob 混采（找补对策 a，见 SynthConfig）。
@@ -357,7 +372,8 @@ def make_sample(cfg: SynthConfig, bg_pool: BackgroundPool, rng):
 
     # ---- 控制向量采样：各系数独立采样 = 解耦监督（CLAUDE.md 第 7/8 节）----
     coeffs = sample_random(rng)
-    focus_on_fg = rng.uniform() < cfg.p_focus_fg and n_fg > 0
+    # 有背景细薄层时强制对焦前景，确保背景细薄结构拿到"该重度虚化"的 GT。
+    focus_on_fg = (add_bg_thin or rng.uniform() < cfg.p_focus_fg) and n_fg > 0
     d_f = float(fg_disps[int(rng.integers(0, n_fg))]) if focus_on_fg else bg_disp
     # K 由"最大 |CoC|"反推：保证盘半径落在采样范围、不超标定上限（~120px）。
     max_dev = max(abs(1.0 - d_f), abs(d_f))
@@ -412,6 +428,11 @@ def make_sample(cfg: SynthConfig, bg_pool: BackgroundPool, rng):
                               disp_gt)
     disp_in = perturb_disparity(disp_gt, rng, cfg)
 
+    # ---- Plan B（D29）：边界带前景占比真值 α_gt（matte 头的免费监督）----
+    # 由【真】视差算（局部背景↔前景的归一化位置）；训练只在边界带内监督。
+    from render.renderer import foreground_occupancy_gt
+    matte_gt = foreground_occupancy_gt(disp_gt, ctrl)
+
     # 控制向量的数值表示（细化网 FiLM 条件；顺序固定 —— 改这里必须同步改细化网）：
     # [d_f, K/100, W040, W131, W222, W220, n_blades/10, vignette_s, vignette_R,
     #  loca_R, laca_R, H_field, azimuth/π]   —— 共 13 维（洋葱圈已移除，DECISIONS D15）
@@ -425,7 +446,7 @@ def make_sample(cfg: SynthConfig, bg_pool: BackgroundPool, rng):
                             device=dev, dtype=torch.float32)
 
     return {"image": image, "disparity": disp_in, "disparity_gt": disp_gt,
-            "bokeh_gt": bokeh_gt, "ctrl_vec": ctrl_vec,
+            "bokeh_gt": bokeh_gt, "matte_gt": matte_gt, "ctrl_vec": ctrl_vec,
             "meta": {"ctrl": ctrl, "H_field": H_field, "azimuth": azimuth,
                      "layer_disps": [bg_disp] + fg_disps,
                      # P1 条件构建与输入侧渲染所需（与 GT 严格同一组几何/子带）：
@@ -486,7 +507,7 @@ def main():
             if arr.ndim == 3:
                 ax.imshow(arr.transpose(1, 2, 0))
             else:
-                ax.imshow(arr, cmap="Spectral_r", vmin=0, vmax=1)
+                ax.imshow(arr, cmap="gray", vmin=0, vmax=1)
             if i == 0:
                 ax.set_title(name, fontsize=10)
             ax.axis("off")

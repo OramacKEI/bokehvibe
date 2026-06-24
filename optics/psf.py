@@ -108,13 +108,16 @@ def pupil_to_psf(P, crop: int | None = None, check_sampling: bool = True):
 # ------------------------------------------------------------------------------
 # 2) 逐通道（RGB）PSF：色差
 # ------------------------------------------------------------------------------
-# 光谱平均的子波长相位缩放因子与权重（±6% 带宽近似相机色滤片的有效宽度）。
-# 设为 ((1.0, 1.0),) 可退回单色行为（调试/对照用）。
+# 光谱平均的子波长相位缩放因子(=λ_c/λ_j)与权重（±6% 带宽近似相机色滤片的有效宽度）。
+# 抹平散景盘【内部】的菲涅耳干涉环（实测内部 ripple ≤3%，肉眼均匀）。盘【边缘】的相干
+# 衍射亮环不随波长平均（位于近固定几何半径），由光瞳 apodization(pupil.DEFAULT_SOFTNESS)
+# 抑制——二者分工互补，见 DECISIONS D28。3 个子波长足够（实测加到 5 个对内部 ripple
+# 无稳定增益，却多 67% FFT，违反训练算力预算）。设为 ((1.0,1.0),) 退回单色（调试用）。
 SPECTRAL_SAMPLES: tuple = ((0.94, 0.25), (1.0, 0.5), (1.06, 0.25))
 
 
 def rgb_psf(grid: dict, H: float, coeffs, crop: int | None = None,
-            softness: float = 0.02, check_sampling: bool = True,
+            softness: float = _pupil.DEFAULT_SOFTNESS, check_sampling: bool = True,
             spectral: bool = True):
     """生成一组 R/G/B 三通道 PSF（堆叠成 [3,h,w]），实现 LoCA + LaCA 色差。
 
@@ -173,11 +176,100 @@ def _radial_shift(psf, shift_px: float):
 
 
 # ------------------------------------------------------------------------------
+# 2b) 几何光学 PSF（光线散射）—— 硬边散景盘（D40）
+# ------------------------------------------------------------------------------
+# 波动光学 PSF（|FFT{P}|²）的散景盘外缘是【衍射软边】，实测恒为盘半径的 ~13%（与盘大小、
+# 光瞳分辨率无关）——因为我们受采样上限约束只能仿真【小离焦】，停在衍射regime；真实散景是
+# 【大离焦】geometric regime（硬边）。BokehMe(scatter 硬盘核)、Wu2010(光线追踪)都靠几何光学
+# 得到硬边 + 像差光强分布。本函数对【我们自己的单波前模型】做几何光线散射：每个光瞳点 (x,y)
+# 的光线落在像面 ∝ 横向光线像差 = ∇W（波前梯度），按光瞳强度 A² 加权 splat 到像面。
+#   · 硬边：落点区域边界 = 光瞳边界（无衍射软化）→ 边宽 ~1px（仅 splat/孔径软度）。
+#   · 焦散：球差使 ∂W/∂ρ 非线性 → 光线在某半径堆叠 → soap 亮边环(过矫正)/cream 亮心(欠矫正)。
+#   · 全像差通用：coma/astig/猫眼/多边形/W060 都由 ∇W 与孔径 A 自然涌现（已验证）。
+#   · 可微：wavefront→gradient→落点→双线性 splat 全程对 coeffs 可微（支撑训练+指纹反演）。
+#   · 无 FFT 采样上限：几何散射无混叠，可渲任意大盘；也无需光谱平均/apodization 抹环。
+GEOM_SCALE: float = 2.02    # 落点(px) = GEOM_SCALE·∇W；标定使盘半径 ≈ 3.93·|W020|(与波动光学/calibrate 一致)
+_GEOM_GRID_CACHE: dict = {}
+
+
+def _geom_grid(size: int, device, dtype):
+    """缓存几何散射用的光瞳网格（坐标固定，只随分辨率变；避免每次重建）。"""
+    key = (size, str(device), str(dtype))
+    if key not in _GEOM_GRID_CACHE:
+        _GEOM_GRID_CACHE[key] = _pupil.make_pupil_grid(size, device=device, dtype=dtype)
+    return _GEOM_GRID_CACHE[key]
+
+
+def geometric_psf(H: float, coeffs, crop: int, channel: int,
+                  samples: int = 512, softness: float = 0.01,
+                  device: str = "cpu", dtype=None):
+    """单通道几何光学 PSF（光线散射）。返回 [crop,crop] 能量归一张量，对 coeffs 可微。
+
+    Args:
+        H: 归一化像高。
+        coeffs: 像差系数（W020 主离焦由渲染器经 replace 注入）。
+        crop: 输出 PSF 边长（偶数，中心 = crop//2）。
+        channel: 0/1/2 → R/G/B（色差经 wavefront 的 channel 注入：LoCA/球色差）。
+        samples: 光瞳网格分辨率（散射点密度；越大盘越平滑，512≈26 万点）。
+        softness: 孔径边软度（几何模式下直接 = 盘边软度；取小值得硬边）。
+    """
+    import torch
+    if dtype is None:
+        dtype = torch.float32
+    grid = _geom_grid(samples, device, dtype)
+    rho = grid["rho"]
+    W = _pupil.wavefront(grid, H, coeffs, channel=channel)        # [N,N] waves
+    A = _pupil.amplitude(grid, H, coeffs, softness=softness)      # [N,N] 振幅
+    sp = 2.0 / (samples - 1)                                      # 网格步长（x,y∈[-1,1]）
+    gy, gx = torch.gradient(W, spacing=(sp, sp))                  # ∂W/∂y(行), ∂W/∂x(列)
+    # 横向光线像差 → 落点(px)，中心在 crop//2。
+    lx = GEOM_SCALE * gx
+    ly = GEOM_SCALE * gy
+    inside = (rho <= 1.0) & (A > 1e-3)                           # 仅通光区光线参与
+    lx = lx[inside]
+    ly = ly[inside]
+    wt = (A[inside] ** 2)                                        # 强度透过率 = 振幅²
+    c = crop // 2
+    px = lx + c
+    py = ly + c
+    x0 = torch.floor(px).long()
+    y0 = torch.floor(py).long()
+    fx = px - x0.to(px.dtype)
+    fy = py - y0.to(py.dtype)
+    psf = torch.zeros(crop * crop, device=lx.device, dtype=lx.dtype)
+    # 双线性 splat：每条光线按落点亚像素权重分摊到 4 个相邻像素（对落点/权重可微）。
+    for dx, dy, frac in ((0, 0, (1 - fx) * (1 - fy)), (1, 0, fx * (1 - fy)),
+                         (0, 1, (1 - fx) * fy), (1, 1, fx * fy)):
+        xi = x0 + dx
+        yi = y0 + dy
+        m = (xi >= 0) & (xi < crop) & (yi >= 0) & (yi < crop)
+        psf.index_add_(0, (yi[m] * crop + xi[m]), (wt * frac)[m])
+    psf = psf.reshape(crop, crop)
+    return psf / (psf.sum() + 1e-12)
+
+
+def rgb_geometric_psf(H: float, coeffs, crop: int, samples: int = 512,
+                      softness: float = 0.01, device: str = "cpu", dtype=None):
+    """三通道几何光学 PSF（[3,crop,crop]）。色差：LoCA/球色差经 wavefront 的 channel；
+    LaCA 经各通道 PSF 沿 +x 径向平移（复用 _radial_shift）。是 rgb_psf 的几何对应物。"""
+    import torch
+    chans = []
+    for c in range(3):
+        p = geometric_psf(H, coeffs, crop, c, samples=samples,
+                          softness=softness, device=device, dtype=dtype)
+        shift_px = coeffs.laca_rgb[c] * float(H)
+        if abs(shift_px) > 1e-6:
+            p = _radial_shift(p, shift_px)
+        chans.append(p)
+    return torch.stack(chans, dim=0)
+
+
+# ------------------------------------------------------------------------------
 # 3) PSF 字典 / 查找表（核心效率手段）
 # ------------------------------------------------------------------------------
 def build_psf_dictionary(coeffs, H_bins, defocus_bins, pupil_size: int,
                          crop: int, device: str = "cpu", chromatic: bool = True,
-                         softness: float = 0.02):
+                         softness: float = _pupil.DEFAULT_SOFTNESS):
     """离线预计算 PSF 查找表（【推理缓存】用途，见模块头与 DECISIONS D9；
     训练/标定时建议按层离焦值现场算 PSF，绕过插值）。
 

@@ -171,6 +171,53 @@ def refine_full_image_v2(net, image, disparity, bokeh_phys, base_ctrl: list,
     return refined, out["error_mask"][0, :, :H, :W]
 
 
+def refine_full_image_matte(net, image, disparity, bokeh_phys, base_ctrl: list,
+                            ctrl, use_gate: bool, H_bins: int = 6):
+    """Plan B（D29）matte 选择式重渲的整图推理。
+
+    与训练 refine_forward 的 matte 分支同口径：
+        B_fg = bokeh_phys（标准渲染）；band = boundary_band；
+        B_bg = render_tiled(image, push_band_to_background(disp))（带内压到背景重虚化）；
+        网络出 raw matte α（整图单前向，逐像素条件图）→
+        B = band·(α·B_fg + (1−α)·B_bg) + (1−band)·B_fg
+    网络从未接触颜色通道 → 真背景（树枝）处 α→0 取 B_bg(虚) → 找补结构上不可能。
+
+    Returns: (refined [3,H,W], matte [1,H,W])
+    """
+    import torch
+    import torch.nn.functional as F
+    from refine.conditioning import boundary_band, condition_maps, field_geometry
+    from render.renderer import push_band_to_background, render_tiled
+
+    _, H, W = image.shape
+    band = boundary_band(disparity, ctrl)                  # [1,H,W]
+    with torch.no_grad():
+        disp_bg = push_band_to_background(disparity, ctrl, band=band)
+        B_bg = render_tiled(image, disp_bg, ctrl).clamp(0.0, 1.0)
+
+    # 网络下采样×4 要求边长为 4 的倍数：replicate 补齐，前向后裁回。
+    ph, pw = (-H) % 4, (-W) % 4
+    pad = (0, pw, 0, ph)
+    img_p = F.pad(image[None], pad, mode="replicate")[0]
+    disp_p = F.pad(disparity[None, None], pad, mode="replicate")[0, 0]
+    phys_p = F.pad(bokeh_phys[None], pad, mode="replicate")[0]
+
+    H_map, az_map = field_geometry(disp_p.shape, disp_p.device, disp_p.dtype)
+    H_centers = torch.linspace(0.0, 1.0, H_bins).tolist()
+    with torch.no_grad():
+        cond = condition_maps(disp_p, ctrl, H_map, az_map, H_centers,
+                              with_descriptors=(net.extra_cond_ch == 9))
+        cvec = torch.tensor(base_ctrl, device=image.device, dtype=image.dtype)
+        cvec[11], cvec[12] = float(H_map.mean()), 1.0
+        # matte 模式：mask_gate=None（门控由 band splice 承担，与训练一致）。
+        out = net(img_p[None], disp_p[None], phys_p[None], cvec[None],
+                  cond_maps=cond[None], mask_gate=None)
+    alpha = out["matte"][0, :, :H, :W]                     # [1,H,W] raw α
+    B_band = alpha * bokeh_phys + (1.0 - alpha) * B_bg
+    refined = (band * B_band + (1.0 - band) * bokeh_phys).clamp(0.0, 1.0)
+    return refined, alpha
+
+
 def find_boundary_zoom(mask, size: int = 192):
     """选误差图响应最强的 size² 窗口（细化网最活跃处=最值得放大核对的边界）。"""
     import torch.nn.functional as F
@@ -201,6 +248,8 @@ def main(argv=None):
     ap.add_argument("--ckpt", type=str, default=None)
     ap.add_argument("--presets", type=str, nargs="+", default=E2E_PRESETS)
     ap.add_argument("--max-width", type=int, default=1024)
+    ap.add_argument("--gamma", type=float, default=1.0,
+                    help="视差去压缩幂律(D39)；<1 拉开远景虚化(慎用,会虚主体)，=1 关闭(默认)")
     args = ap.parse_args(argv)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -214,11 +263,19 @@ def main(argv=None):
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     extra_ch = int(ck.get("extra_cond_ch", 0))
     use_gate = bool(ck.get("mask_edge_gate", False))
-    net = RefineNet(extra_cond_ch=extra_ch).to(device)
+    matte_mode = bool(ck.get("matte_mode", False))
+    # P2a（D32）：按 checkpoint 记录的 block/宽度重建（旧 ckpt 无此键 → 回落 v1 默认）。
+    block_type = str(ck.get("block_type", "film_res"))
+    ar_mid = int(ck.get("ar_mid", 96))
+    iu_mid = int(ck.get("iu_mid", 48))
+    net = RefineNet(extra_cond_ch=extra_ch, matte_mode=matte_mode,
+                    block_type=block_type, ar_mid=ar_mid, iu_mid=iu_mid).to(device)
     net.load_state_dict(ck["model"])
     net.eval()
+    arch = ("Plan B matte 选择式重渲" if matte_mode
+            else "v2 整图单前向" if extra_ch else "v1 滑窗")
     print(f"[e2e] 细化网就绪（训练 {ck['iter']} 步，{ck['n_params']:,} 参数，"
-          f"{'v2 整图单前向' if extra_ch else 'v1 滑窗'}，门控={use_gate}）")
+          f"{arch}，门控={use_gate}）")
 
     # ---- 2) 深度：DA V2-Small → 视差 → 边缘吸附（与训练输入侧同路径）----
     rgb = load_image(Path(args.image), max_width=args.max_width)
@@ -226,6 +283,14 @@ def main(argv=None):
     disp_np = backend.infer_disparity((rgb * 255).astype("uint8"))
     image = torch.from_numpy(rgb.transpose(2, 0, 1).copy()).to(device)
     disparity = snap_disparity_edges(torch.from_numpy(disp_np).to(device))
+    # 去压缩重映射（D39）：**默认关闭**（γ=1）；好深度下施 γ<1 反而虚掉主体。仅手动开。
+    from render.demo import remap_disparity
+    disparity = remap_disparity(disparity, getattr(args, "gamma", 1.0))
+    # 高光核心深度统一（D43）：消除小灯珠深度跳变造成的嵌套同心环（与 render.demo 一致）。
+    from render.renderer import unify_highlight_core_depth
+    disparity, n_uni = unify_highlight_core_depth(image, disparity)
+    if n_uni > 0:
+        print(f"[e2e] 高光核心深度统一: {n_uni} 个灯珠核心 → 消嵌套环")
     save_disparity_visualization(disparity.cpu().numpy(),
                                  OUT_DIR / "e2e_disparity.png")
 
@@ -239,7 +304,9 @@ def main(argv=None):
         coeffs = PRESETS[name]
         ctrl = RenderControl(focus_disparity=d_f, aperture_K=K,
                              focus_tolerance=tol, coeffs=coeffs,
-                             highlight_gain=8.0, highlight_thresh=0.82)
+                             # D45：gamma 回归标准 2.2（默认），保留球差盘内对比（γ=4 压平亮边/亮心）；
+                             # 不用 gain 放大（从 LDR 猜测放大致溢出+非点光源冒假弥散圆）。
+                             highlight_gain=0.0)
         t0 = time.time()
         with torch.no_grad():
             phys = render_tiled(image, disparity, ctrl).clamp(0.0, 1.0)
@@ -252,7 +319,10 @@ def main(argv=None):
                      coeffs.vignette_radius, coeffs.loca_rgb[0],
                      coeffs.laca_rgb[0], 0.0, 0.0]
         t0 = time.time()
-        if extra_ch > 0:
+        if matte_mode:
+            refined, mask = refine_full_image_matte(net, image, disparity, phys,
+                                                    base_ctrl, ctrl, use_gate)
+        elif extra_ch > 0:
             refined, mask = refine_full_image_v2(net, image, disparity, phys,
                                                  base_ctrl, ctrl, use_gate)
         else:

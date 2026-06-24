@@ -10,7 +10,9 @@ project:
 
 # --- 深度（冻结，仅推理）---
 depth:
-  model: depth_anything_v2_small   # 仅 Small：Apache-2.0，25M（DECISIONS D2）
+  model: depth_anything_v2_base    # 默认 Base/vitb,97M（D25：推理深度优于 Small；冻结仅推理,
+                                   # 不算可训练参数→不碰 RQ2）。vits=Small/Apache-2.0 可切回；
+                                   # vitb/vitl=CC-BY-NC-4.0,学术可用,论文须声明
   normalize_disparity: true        # 统一归一化到 [0,1]，语义=视差(近大远小)
   snap_edges: true                 # 渲染前做视差边缘吸附（DECISIONS D13），训练输入侧同样适用
 
@@ -40,7 +42,13 @@ refine:
   # --- 细化网 v2 (P1) 开关（NETWORK_DESIGN §4；全关 = 复现 v1）---
   spatial_cond: true        # P1a 空间物理条件图（H/sin az/cos az 逐像素，+3ch）
   psf_desc: true            # P1b PSF 描述子图（r_eq/elong/取向/环比/T，+6ch；需 spatial_cond）
-  mask_edge_gate: true      # 误差图×视差边缘带门控（找补对策 b，PROJECT_STATUS §6 2026-06-12）
+  mask_edge_gate: true      # 误差图/matte ×视差边缘带门控（找补对策 b，PROJECT_STATUS §6 2026-06-12）
+  matte_mode: true          # Plan B（D29）：网络只出 1ch 几何 matte α，由 B_fg/B_bg 选择式重渲
+                            # → 找补结构上不可能。false=复现 v1 误差图融合式（消融基线）
+  # --- P2a（D32）残差块类型与宽度 ---
+  block_type: film_res      # film_res=v1 plain conv×2（默认/基线）；naf=NAFNet 块
+  ar_mid: 96                # ARNet 通道宽（naf 同参对照用 144）
+  iu_mid: 48                # IUNet 通道宽（naf 同参对照用 72）
 
 # --- 训练（12GB 约束）---
 train:
@@ -50,7 +58,8 @@ train:
   losses: [l1, perceptual]   # 重建：L1 + VGG/LPIPS（CLAUDE.md 第 8 节）
   lambda_perceptual: 0.1     # 感知损失权重（对融合输出 B）
   # 防"误差图塌缩"的两项辅助损失（DECISIONS D19，BokehMe 同款对策）：
-  lambda_neural: 0.5         # 神经分支直接监督 L1(B_neural, GT)，不经 mask 门控
-  lambda_mask: 0.2           # 误差图显式监督 L1(m, m_gt)
+  lambda_neural: 0.5         # 神经分支直接监督 L1(B_neural, GT)，不经 mask 门控（仅 v1）
+  lambda_mask: 0.2           # 误差图显式监督 L1(m, m_gt)（仅 v1）
+  lambda_matte: 0.3          # Plan B：matte 直监 L1(α, α_gt) 带内（D29）；重建损失为主、此项为辅
   mask_gain: 10.0            # m_gt = clamp(gain·|B_phys−GT|, 0, 1)
   boundary_weight: 4.0       # 重建损失逐像素权重 1+bw·m_gt（边界梯度防稀释）

@@ -5,7 +5,7 @@ M2 渲染器的【首张散景图】demo：真实照片 → DA V2 视差 → 像
 
 跑通后产出（outputs/render_test/）：
     demo_input.png         输入图（缩放后）
-    demo_disparity.png     DA V2 视差伪彩图（肉眼核对：近处更亮）
+    demo_disparity.png     DA V2 视差灰度图（肉眼核对：近处更亮）
     demo_<preset>.png      各风格预设的散景结果
     demo_grid.png          总对比图（输入 + 视差 + 各预设并排）
 
@@ -54,20 +54,54 @@ def auto_focus_params(disparity):
     对焦：画面中心大窗口（假设主体居中）的视差中位数；
     容差 δ0：主体自身视差跨度（中心窗口 p15~p85 半宽）——DA V2 的相对视差会把
     主体拉出 0.1~0.3 跨度，没有容差主体内部会被虚掉（DECISIONS D14）；
-    光圈 K：背景（5 百分位视差）有效 CoC ≈ 22px（盘结构可见、不至于糊成一片），
-    全图最大有效 CoC 压在 60px 内。
+    光圈 K：背景（5 百分位视差）有效 CoC ≈ 30px（散景球明显、接近真实大光圈），
+    全图最大有效 CoC 压在 120px 内。
+
+    【D45 背景虚化不足修复】旧版背景目标 22px + 最大 CoC 上限 60px：当画面有【极近前景】
+    （如贴镜松枝，视差≈0.8）时，max_dev 很大 → "最大 CoC 60px" 上限把 K 压到很小
+    （实测 21.jpg K 被压到 79）→ 背景 CoC 只剩 ~10px、虚化严重不足（用户反馈）。根因：
+    60px 上限是为【旧 wave 模式的 FFT 采样上限 W020<N/8】设的，而默认 geom 模式（D40）
+    【无采样上限】、可渲任意大盘 → 上限可放宽。物理上前景极近物体本就该糊成一片（CoC 无上限），
+    不该为压前景而牺牲背景。改：背景目标 22→30px、最大 CoC 60→120px（geom 友好）。
+    注意：若手动切 psf_mode='wave'，前景大盘可能触发采样上限告警，届时需调小 K 或增大 pupil_size。
     """
     import torch
     h, w = disparity.shape
     center = disparity[h // 2 - 100:h // 2 + 100, w // 2 - 80:w // 2 + 80].flatten()
     d_f = float(center.median())
-    tol = float((torch.quantile(center, 0.85) - torch.quantile(center, 0.15)) / 2)
-    tol = min(max(tol, 0.04), 0.15)
+    # 容差 tol 收紧（D39）：过宽的焦带会一直延伸到背景附近 → 背景刚出焦带、CoC 很小 → 背景
+    # 看着仍清晰（P2 根因之一）。旧 (p15~p85)/2、上限 0.15 被对焦窗里的背景撑大到 ~0.12；
+    # 改 (p20~p80)/2、上限 0.10，焦带只罩主体自身跨度，背景更早进入虚化。
+    tol = float((torch.quantile(center, 0.80) - torch.quantile(center, 0.20)) / 2)
+    tol = min(max(tol, 0.03), 0.10)
     d_far = float(torch.quantile(disparity.flatten(), 0.05))
-    K = 22.0 / max(abs(d_f - d_far) - tol, 0.05)
+    K = 26.0 / max(abs(d_f - d_far) - tol, 0.05)         # 背景 CoC 目标 26px（散景球明显但不过度）
     max_dev = max(d_f, 1.0 - d_f) - tol
-    K = min(K, 60.0 / max(max_dev, 0.1))
+    K = min(K, 100.0 / max(max_dev, 0.1))                # 最大 CoC 100px（geom 无采样上限；D46 由 120
+                                                          # 回调到 100：120 在极近前景下 K 过大→背景过度
+                                                          # 虚化、杂乱背景成"太多散景盘"，100 更平衡）
     return d_f, tol, K
+
+
+def remap_disparity(disparity, gamma: float = 1.0):
+    """视差去压缩重映射（D39）——对抗 DA V2 的【远/中景非线性压缩】。
+
+    物理上 CoC 对【视差(1/物距)】是线性的（CoC 对【物距】才非线性），而 DA V2 输出的就是
+    视差，故我们的 r=K|D−d_f| 已是正确物理，**不需要为物理补非线性**。但 DA V2 的"仿射不变
+    逆深度"在实践中并非严格线性于 1/Z：它把中/远景压缩，使主体（人）的视差被拉得离远背景太近
+    （21.jpg：人 0.18、建筑 0.0，间隔仅 0.18）→ 焦内主体一动背景就跟着清晰。本函数用幂律
+    D' = D^γ（γ<1）把低-中视差段【展开】、近景段压缩，**校正深度模型的压缩偏差**（不是补物理
+    非线性）。γ=1 关闭；γ≈0.6~0.8 适合"近前景+中景主体+远背景"被压扁的场景。
+
+    Args:
+        disparity: [H,W] 归一化视差（[0,1]，近大远小）。
+        gamma: 幂律指数。<1 拉开远-中分离（背景更虚）；=1 不变。
+    Returns:
+        [H,W] 重映射后的视差（仍在 [0,1]）。
+    """
+    if abs(gamma - 1.0) < 1e-6:
+        return disparity
+    return disparity.clamp(0.0, 1.0) ** gamma
 
 
 def main():
@@ -99,8 +133,22 @@ def main():
     # 视差边缘吸附：扫平 DA V2 在物体边界的"软坡带"，否则主体周围一圈半虚化轮廓。
     from render.renderer import snap_disparity_edges
     disparity = snap_disparity_edges(disparity)
+    # 去压缩重映射（D39）：**默认关闭**（γ=1）。好深度（vitl@770）下主体本就与背景分开，施 γ<1
+    # 反而把 d_f 推高、虚掉主体（实测女生脸变糊）。仅当确认 DA V2 压扁了某场景时手动开（sys.argv[2]）。
+    gamma = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
+    disparity = remap_disparity(disparity, gamma)
+    if abs(gamma - 1.0) > 1e-6:
+        print(f"[demo] 视差去压缩 γ={gamma}")
     save_disparity_visualization(disparity.cpu().numpy(),
                                  OUT_DIR / "demo_disparity_snapped.png")
+
+    # 高光核心深度统一（D43）：消除小灯珠内部深度跳变造成的"嵌套同心环/外圈淡盘"。
+    # 真实图里 DA V2 对小过曝灯珠的深度估计不可靠（同一灯珠像素被判不同视差→分到不同
+    # CoC 层→大小不一的盘叠加）。把每个真饱和高光核心统一为其最亮像素的深度→单灯珠单盘。
+    from render.renderer import unify_highlight_core_depth
+    disparity, n_uni = unify_highlight_core_depth(image, disparity)
+    if n_uni > 0:
+        print(f"[demo] 高光核心深度统一: {n_uni} 个灯珠核心 → 消嵌套环")
 
     # ---- 2) 对焦与光圈（逻辑见 auto_focus_params）----
     d_f, tol, K = auto_focus_params(disparity)
@@ -116,8 +164,13 @@ def main():
         ctrl = RenderControl(focus_disparity=d_f, aperture_K=K,
                              focus_tolerance=tol,
                              coeffs=PRESETS[name], n_layers=24,
-                             highlight_gain=8.0,         # 高光提升：让灯点出亮斑散景
-                             highlight_thresh=0.82)
+                             # 【D45 gamma 回归标准 2.2】D44 用 γ=4 提亮散景球，但 `**(1/4)` 把球差盘内
+                             # 对比【压平】（线性域亮边 6.5× → 显示仅 1.6×）→ soap 亮边/cream 亮心消失、
+                             # 且整体"像素响应太强/不柔和"（用户反馈）。回归标准 sRGB γ=2.2（RenderControl
+                             # 默认）：球差对比保留（显示 2.3×）、更柔和、物理正确显示。散景球偏暗是 LDR 输入
+                             # 固有限制（点光源真实 HDR 亮度被 8-bit 截断）——纯夜景可选开温和 highlight_gain，
+                             # 但【不用非物理高 γ 压对比来补偿】。详见 DECISIONS D45。
+                             highlight_gain=0.0)
         t0 = time.time()
         with torch.no_grad():                            # demo 不需要梯度，省显存
             out = render(image, disparity, ctrl, field_varying=field_varying)
@@ -137,7 +190,7 @@ def main():
     panels = [("input", rgb), ("disparity", None)] + results
     for ax, (name, img_p) in zip(axes.flat, panels):
         if name == "disparity":
-            ax.imshow(disp_np, cmap="Spectral_r", vmin=0, vmax=1)
+            ax.imshow(disp_np, cmap="gray", vmin=0, vmax=1)
         else:
             ax.imshow(img_p)
         ax.set_title(name, fontsize=10)
@@ -173,7 +226,7 @@ def render_lights_panel():
     S = 512
     rng = np.random.default_rng(7)
     img = torch.zeros(3, S, S, device=device)
-    for _ in range(60):                                   # 随机彩色灯点
+    for _ in range(16):                                   # 16 个灯点：减少重叠让单盘结构可见
         y, x = int(rng.integers(8, S - 8)), int(rng.integers(8, S - 8))
         color = torch.tensor(rng.uniform(0.6, 1.0, 3), device=device,
                              dtype=img.dtype)
@@ -184,9 +237,16 @@ def render_lights_panel():
     for ax in axes.flat:
         ax.axis("off")                                    # 先全关，有内容的再画
     for ax, (name, field_varying) in zip(axes.flat, DEMO_PRESETS):
-        ctrl = RenderControl(focus_disparity=0.85, aperture_K=40.0,
-                             coeffs=PRESETS[name], n_layers=8,
-                             highlight_gain=10.0, highlight_thresh=0.5)
+        # n_layers 用默认（自适应）：旧值 8 在 K=40 下相邻层 CoC 步长达 ~5px，
+        # 单个灯点被 tent 拆到两层 → 弥散圆"中心亮点"伪影（D31）。
+        # K=75（盘半径≈64px）：小盘(K=40,34px)处于近焦过渡区、边缘本就软（物理正确，
+        # 非 bug，见 outputs/render_test/disc_size_edge.png）；大盘进入几何区 → 平顶+锐边，
+        # 盘内的肥皂泡/猫眼/多边形结构也看得更清。
+        ctrl = RenderControl(focus_disparity=0.85, aperture_K=75.0,
+                             coeffs=PRESETS[name],
+                             # D45：gamma 回归标准 2.2（默认），保留球差盘内对比（γ=4 会压平亮边/亮心）；
+                             # 下方 o/o.max() 归一化提亮看形态，故纯夜景盘偏暗不影响形态展示。
+                             highlight_gain=0.0)
         with torch.no_grad():
             out = render(img, disp, ctrl, field_varying=field_varying)
         o = out.clamp(0, 1).cpu().numpy().transpose(1, 2, 0)

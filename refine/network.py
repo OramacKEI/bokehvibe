@@ -106,6 +106,117 @@ if _TORCH:
             h = h * (1.0 + gamma) + beta
             return self.act(x + h)
 
+    # --------------------------------------------------------------------------
+    # P2a：NAFNet 块（NETWORK_DESIGN §5.1，DECISIONS D32）—— FiLMResBlock 的替代
+    # --------------------------------------------------------------------------
+    class LayerNorm2d(nn.Module):
+        """通道维 LayerNorm：对 [B,C,H,W] 每个空间位置在 C 维上归一化（NAFNet 用）。
+
+        与 nn.LayerNorm（归一化最后若干维）不同——这里归一化【通道】维，
+        保持空间结构。可学习逐通道仿射 (weight, bias)。
+        """
+
+        def __init__(self, channels: int, eps: float = 1e-6):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(channels))
+            self.bias = nn.Parameter(torch.zeros(channels))
+            self.eps = eps
+
+        def forward(self, x):
+            mu = x.mean(dim=1, keepdim=True)
+            var = x.var(dim=1, keepdim=True, unbiased=False)
+            x = (x - mu) / torch.sqrt(var + self.eps)
+            return x * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+
+    class NAFFiLMBlock(nn.Module):
+        """NAFNet 块 + FiLM 条件（P2a，NETWORK_DESIGN §5.1）。
+
+        结构（两子块各带残差缩放）：
+          空间子块：LN → FiLM(γ,β) → 1×1↑2C → 3×3 深度可分 → SimpleGate(→C)
+                    → SCA(简化通道注意力) → 1×1→C，  x ← x + β_s·(·)
+          通道子块：LN → 1×1↑2C → SimpleGate(→C) → 1×1→C，  x ← x + γ_s·(·)
+
+        关键设计（依据 NAFNet, ECCV22；NAFBET 已在散景变换任务验证）：
+        - **SimpleGate** 把特征对半拆开逐元素相乘（2C→C），用乘性门【替代激活函数】
+          （无 ReLU/GELU）——这是 NAFNet 参数效率的核心。
+        - **SCA**（Simplified Channel Attention）：全局平均池化→1×1→逐通道缩放，
+          比 SE 注意力更省，给每通道一个全局自适应增益。
+        - **深度可分卷积**：3×3 只在通道内做空间混合，1×1 做通道混合 → 同感受野下
+          参数远少于 plain conv（故 NAF 块在同 ch/块数下比 FiLMResBlock 更省参）。
+        - **FiLM 挂在空间子块 LN 之后**（条件注入点，NETWORK_DESIGN §5.1）：网络仍按
+          镜头/像差系数分化边界修复策略，与 FiLMResBlock 同口径。
+        - 残差缩放 β_s/γ_s（NAFNet 的可学习 LayerScale）初始化 =1（标准残差）：
+          块从首步即做实变换、梯度正常流（不取 NAFNet 的 0 初始化——那会让块首步
+          梯度只到缩放系数、暂时阻断卷积/FiLM；本项目靠近零的 head 已保证输出稳定起点，
+          见 ARNet.head 注释，故这里无需再靠 0 残差缩放求稳）。
+        """
+
+        def __init__(self, ch: int, cond_feat: int = 64,
+                     dw_expand: int = 2, ffn_expand: int = 2):
+            super().__init__()
+            dw_ch = ch * dw_expand
+            ffn_ch = ch * ffn_expand
+            # 空间子块
+            self.norm1 = LayerNorm2d(ch)
+            self.film = nn.Linear(cond_feat, 2 * ch)
+            self.conv1 = nn.Conv2d(ch, dw_ch, 1)                       # 1×1 升维
+            self.conv2 = nn.Conv2d(dw_ch, dw_ch, 3, padding=1,
+                                   groups=dw_ch)                        # 3×3 深度可分
+            # SimpleGate: dw_ch → dw_ch//2 = ch（设 dw_expand=2）
+            self.sca = nn.Sequential(                                   # 简化通道注意力
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(dw_ch // 2, dw_ch // 2, 1))
+            self.conv3 = nn.Conv2d(dw_ch // 2, ch, 1)                  # 1×1 降维
+            # 通道子块（FFN）
+            self.norm2 = LayerNorm2d(ch)
+            self.conv4 = nn.Conv2d(ch, ffn_ch, 1)
+            # SimpleGate: ffn_ch → ffn_ch//2 = ch
+            self.conv5 = nn.Conv2d(ffn_ch // 2, ch, 1)
+            # 可学习残差缩放（LayerScale，初始化 1 = 标准残差，理由见 docstring）。
+            self.beta = nn.Parameter(torch.ones(1, ch, 1, 1))
+            self.gamma = nn.Parameter(torch.ones(1, ch, 1, 1))
+
+        @staticmethod
+        def _simple_gate(x):
+            a, b = x.chunk(2, dim=1)
+            return a * b
+
+        def forward(self, x, cond_feat):
+            # --- 空间子块 ---
+            h = self.norm1(x)
+            gamma, beta = self.film(cond_feat)[:, :, None, None].chunk(2, dim=1)
+            h = h * (1.0 + gamma) + beta                                # FiLM 挂在 LN 之后
+            h = self.conv1(h)
+            h = self.conv2(h)
+            h = self._simple_gate(h)                                    # 2C → C
+            h = h * self.sca(h)                                         # 通道注意力
+            h = self.conv3(h)
+            x = x + h * self.beta
+            # --- 通道子块（FFN）---
+            h = self.norm2(x)
+            h = self.conv4(h)
+            h = self._simple_gate(h)                                    # 2C → C
+            h = self.conv5(h)
+            x = x + h * self.gamma
+            return x
+
+    def _make_block(block_type: str, ch: int, cond_feat: int):
+        """残差块工厂：'film_res'（v1 plain conv×2）/ 'naf'（P2a NAFNet 块）。
+        两者 forward 签名一致 (x, cond_feat)，可在 ARNet/IUNet 里无缝替换。"""
+        if block_type == "naf":
+            return NAFFiLMBlock(ch, cond_feat)
+        return FiLMResBlock(ch, cond_feat)
+
+    def _run_block(blk, h, cond_feat, use_checkpoint: bool):
+        """运行一个残差块；use_checkpoint=True 时用梯度检查点（反向重算激活、
+        不缓存中间张量）。NAF 块在全分辨率 IUNet 的激活显存是 film_res 的数倍
+        （2 子块 ×2 通道扩张 + depthwise），开检查点可在同 batch/crop 下放进 12GB，
+        代价 ~25% 慢（D32）。非重入模式正确处理 (h, cond_feat) 多输入与 FiLM 链路。"""
+        if use_checkpoint:
+            from torch.utils.checkpoint import checkpoint
+            return checkpoint(blk, h, cond_feat, use_reentrant=False)
+        return blk(h, cond_feat)
+
     # ==========================================================================
     # 2) ARNet：低分辨率的"自适应渲染"——预测粗神经散景 + 误差图
     # ==========================================================================
@@ -118,27 +229,30 @@ if _TORCH:
         """
 
         def __init__(self, in_ch: int = 8, mid: int = 96, n_blocks: int = 3,
-                     cond_feat: int = 64):
+                     cond_feat: int = 64, out_ch: int = 4,
+                     block_type: str = "film_res", grad_checkpoint: bool = False):
             super().__init__()
             self.down = nn.PixelUnshuffle(2)
             self.conv0 = nn.Conv2d(in_ch * 4, mid, 3, padding=1)
             self.blocks = nn.ModuleList(
-                [FiLMResBlock(mid, cond_feat) for _ in range(n_blocks)])
-            # 头输出 (3 残差 + 1 误差 logit) × 4，PixelShuffle 还原空间分辨率。
-            self.head = nn.Conv2d(mid, 4 * 4, 3, padding=1)
+                [_make_block(block_type, mid, cond_feat) for _ in range(n_blocks)])
+            self.grad_checkpoint = grad_checkpoint
+            # 头输出 out_ch × 4，PixelShuffle 还原空间分辨率。
+            # v1 融合式：out_ch=4（3 散景残差 + 1 误差 logit）；
+            # Plan B matte 式：out_ch=1（粗 matte logit，D29）。
+            self.head = nn.Conv2d(mid, out_ch * 4, 3, padding=1)
             self.up = nn.PixelShuffle(2)
             self.act = nn.ELU(inplace=True)
             # 近零初始化（不能严格置零：W=0 会把流向 FiLM/cond 的梯度全部阻断，
-            # 条件分支永远学不动）。std=1e-4 → 起点仍≈透传物理渲染。
+            # 条件分支永远学不动）。std=1e-4 → 起点稳定。
             nn.init.normal_(self.head.weight, std=1e-4)
             nn.init.zeros_(self.head.bias)
 
         def forward(self, x_half, cond_feat):
             h = self.act(self.conv0(self.down(x_half)))
             for blk in self.blocks:
-                h = blk(h, cond_feat)
-            out = self.up(self.head(h))            # [B,4,H/2,W/2]
-            return out[:, :3], out[:, 3:]          # (散景残差, 误差图 logit)
+                h = _run_block(blk, h, cond_feat, self.grad_checkpoint and self.training)
+            return self.up(self.head(h))            # [B,out_ch,H/2,W/2]（caller 负责拆分）
 
     # ==========================================================================
     # 3) IUNet：全分辨率精化——把粗神经散景按全分辨率引导信息锐化
@@ -147,12 +261,15 @@ if _TORCH:
         """BokehMe IUNet 的轻量 FiLM 版（单级 ×2；更高分辨率推理时可迭代调用）。"""
 
         def __init__(self, guide_ch: int = 8, mid: int = 48, n_blocks: int = 2,
-                     cond_feat: int = 64):
+                     cond_feat: int = 64, coarse_ch: int = 3, out_ch: int = 3,
+                     block_type: str = "film_res", grad_checkpoint: bool = False):
             super().__init__()
-            self.conv0 = nn.Conv2d(guide_ch + 3, mid, 3, padding=1)
+            # coarse_ch / out_ch：v1 散景式=3/3；Plan B matte 式=1/1（粗→精 matte logit）。
+            self.conv0 = nn.Conv2d(guide_ch + coarse_ch, mid, 3, padding=1)
             self.blocks = nn.ModuleList(
-                [FiLMResBlock(mid, cond_feat) for _ in range(n_blocks)])
-            self.head = nn.Conv2d(mid, 3, 3, padding=1)
+                [_make_block(block_type, mid, cond_feat) for _ in range(n_blocks)])
+            self.grad_checkpoint = grad_checkpoint
+            self.head = nn.Conv2d(mid, out_ch, 3, padding=1)
             self.act = nn.ELU(inplace=True)
             nn.init.normal_(self.head.weight, std=1e-4)   # 近零，理由同 ARNet.head
             nn.init.zeros_(self.head.bias)
@@ -160,7 +277,7 @@ if _TORCH:
         def forward(self, guide_full, coarse_up, cond_feat):
             h = self.act(self.conv0(torch.cat([guide_full, coarse_up], dim=1)))
             for blk in self.blocks:
-                h = blk(h, cond_feat)
+                h = _run_block(blk, h, cond_feat, self.grad_checkpoint and self.training)
             return coarse_up + self.head(h)        # 残差精化
 
     # ==========================================================================
@@ -189,16 +306,32 @@ if _TORCH:
         def __init__(self, cond_dim: int = 13, cond_feat: int = 64,
                      ar_mid: int = 96, ar_blocks: int = 3,
                      iu_mid: int = 48, iu_blocks: int = 2,
-                     extra_cond_ch: int = 0):
+                     extra_cond_ch: int = 0, matte_mode: bool = False,
+                     block_type: str = "film_res", grad_checkpoint=None):
             super().__init__()
             self.cond_dim = cond_dim
             self.extra_cond_ch = extra_cond_ch              # 0=v1；3=P1a；9=P1a+P1b
+            self.block_type = block_type                    # 'film_res'(v1) / 'naf'(P2a)
+            # Plan B（D29）：matte_mode=True → 网络只输出 1ch 几何 matte α，不画颜色；
+            # 由 train/e2e 用 α 在两张物理渲染 B_fg/B_bg 间逐像素选择（找补结构上不可能）。
+            self.matte_mode = matte_mode
+            # 梯度检查点：None=自动（naf 开、film_res 关——naf 全分辨率激活显存数倍，D32）。
+            # 只挂在【IUNet】（全分辨率，激活显存大头）；ARNet 在 1/4 分辨率激活很小，
+            # 不必检查点（省去其反向重算时间）。
+            if grad_checkpoint is None:
+                grad_checkpoint = (block_type == "naf")
+            self.grad_checkpoint = grad_checkpoint
             guide_ch = 8 + extra_cond_ch
             self.cond_enc = CondEncoder(cond_dim, cond_feat)
+            head_ch = 1 if matte_mode else 4                # matte: 仅 1ch；v1: 3 残差+1 mask
+            coarse_ch = 1 if matte_mode else 3
             self.arnet = ARNet(in_ch=guide_ch, mid=ar_mid, n_blocks=ar_blocks,
-                               cond_feat=cond_feat)
+                               cond_feat=cond_feat, out_ch=head_ch,
+                               block_type=block_type, grad_checkpoint=False)
             self.iunet = IUNet(guide_ch=guide_ch, mid=iu_mid, n_blocks=iu_blocks,
-                               cond_feat=cond_feat)
+                               cond_feat=cond_feat, coarse_ch=coarse_ch,
+                               out_ch=coarse_ch, block_type=block_type,
+                               grad_checkpoint=grad_checkpoint)
 
         @staticmethod
         def _defocus_hint(disparity, ctrl_vec):
@@ -227,24 +360,36 @@ if _TORCH:
                 parts.append(cond_maps)
             guide = torch.cat(parts, dim=1)
 
-            # ---- ARNet @ 半分辨率：粗神经散景 + 误差图 ----
             guide_half = F.interpolate(guide, scale_factor=0.5, mode="bilinear",
                                        align_corners=False)
-            res_half, mask_logit_half = self.arnet(guide_half, cond)
-            coarse = guide_half[:, 4:7] + res_half  # B_phys(半分) + 残差
+            ar_out = self.arnet(guide_half, cond)         # [B,head_ch,H/2,W/2]
 
-            # ---- IUNet @ 全分辨率：上采样 + 引导精化 ----
+            # ============ Plan B：matte 式（D29）—— 网络只输出 1ch 几何 matte ============
+            if self.matte_mode:
+                # ARNet 出粗 matte logit，IUNet 全分辨率精化（粗→精，1ch）。
+                coarse = ar_out                            # [B,1,H/2,W/2] 粗 matte logit
+                coarse_up = F.interpolate(coarse, size=image.shape[-2:],
+                                          mode="bilinear", align_corners=False)
+                matte_logit = self.iunet(guide, coarse_up, cond)   # 残差精化（仍 logit）
+                matte = torch.sigmoid(matte_logit)
+                if mask_gate is not None:
+                    # 边界带门控：带外 α≡0 → 选择式重渲在带外恒取 B_phys（见 train/e2e
+                    # 的 splice）。把网络作用从结构上限制在边界带内（D22/D23 门控沿用）。
+                    matte = matte * mask_gate
+                # error_mask 键复用 matte（供 e2e 的 find_boundary_zoom/可视化沿用同接口）。
+                return {"matte": matte, "matte_logit": matte_logit,
+                        "error_mask": matte}
+
+            # ============ v1：误差图融合式（B_neural 直接出颜色，保留作消融基线）============
+            res_half, mask_logit_half = ar_out[:, :3], ar_out[:, 3:]
+            coarse = guide_half[:, 4:7] + res_half         # B_phys(半分) + 残差
             coarse_up = F.interpolate(coarse, size=image.shape[-2:],
                                       mode="bilinear", align_corners=False)
             bokeh_neural = self.iunet(guide, coarse_up, cond)
-
-            # ---- 误差图融合：只在物理渲染出错处使用神经结果 ----
             mask = torch.sigmoid(
                 F.interpolate(mask_logit_half, size=image.shape[-2:],
                               mode="bilinear", align_corners=False))
             if mask_gate is not None:
-                # 边界带门控：带外 m≡0（神经分支结构性失效），从根上杜绝
-                # 在平坦/纹理区"找补"锐利纹理的红线违规。
                 mask = mask * mask_gate
             bokeh = mask * bokeh_neural + (1.0 - mask) * bokeh_phys
             return {"bokeh": bokeh, "bokeh_neural": bokeh_neural,
@@ -265,16 +410,22 @@ def _smoke_test():
     import matplotlib.pyplot as plt
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # P1 默认配置：9 通道物理条件图（P1a 空间 3 + P1b 描述子 6）。
-    net = RefineNet(extra_cond_ch=9).to(device)
+    # Plan B 默认配置：matte 式 + 9 通道物理条件图（P1a 空间 3 + P1b 描述子 6）。
+    net = RefineNet(extra_cond_ch=9, matte_mode=True).to(device)
 
-    # ① 参数量：必须 < 2M（CLAUDE.md 第 5 节硬约束）。
+    # ① 参数量：必须 < 2M（CLAUDE.md 第 5 节硬约束）。matte 头比 v1 更省（少 3ch 颜色输出）。
     n_params = count_parameters(net)
-    n_v1 = count_parameters(RefineNet(extra_cond_ch=0))
+    n_v1 = count_parameters(RefineNet(extra_cond_ch=9, matte_mode=False))
     assert n_params < 2_000_000, f"参数量 {n_params:,} 超出 2M 轻量铁律！"
-    print(f"[refine] 可训练参数：{n_params:,}（< 2M ✓，v1 基线 {n_v1:,}）  "
+    print(f"[refine] matte 式可训练参数：{n_params:,}（< 2M ✓，v1 融合式同条件 {n_v1:,}）  "
           f"ARNet={count_parameters(net.arnet):,} IUNet={count_parameters(net.iunet):,} "
           f"Cond={count_parameters(net.cond_enc):,}")
+    # P2a（D32）：NAFNet 块的参数对照。同 ch(96/48) 约半参；加宽到 144/72 ≈ 同预算。
+    n_naf = count_parameters(RefineNet(extra_cond_ch=9, matte_mode=True, block_type="naf"))
+    n_naf_w = count_parameters(RefineNet(extra_cond_ch=9, matte_mode=True,
+                                         block_type="naf", ar_mid=144, iu_mid=72))
+    print(f"[refine] P2a NAFNet 块：同 ch(96/48)={n_naf:,}（≈半参）；"
+          f"加宽(144/72)={n_naf_w:,}（≈同预算 film_res）")
 
     # ② 前向形状 + ③ 可微性（对网络参数与 ctrl_vec 都要有梯度——FiLM 链路）。
     B, S = 2, 128
@@ -285,41 +436,51 @@ def _smoke_test():
     cmaps = torch.rand(B, 9, S, S, device=device)
     gate = torch.rand(B, 1, S, S, device=device)
     out = net(img, disp, phys, cvec, cond_maps=cmaps, mask_gate=gate)
-    assert out["bokeh"].shape == (B, 3, S, S) and out["error_mask"].shape == (B, 1, S, S)
-    out["bokeh"].mean().backward()
+    assert out["matte"].shape == (B, 1, S, S), out["matte"].shape
+    assert (out["matte"] >= 0).all() and (out["matte"] <= 1).all(), "matte 应 ∈[0,1]"
+    out["matte"].mean().backward()
     g_net = sum(float(p.grad.abs().sum()) for p in net.parameters()
                 if p.grad is not None)
     g_c = float(cvec.grad.abs().sum())
     assert g_net > 0 and g_c > 0, f"梯度断链：net={g_net}, ctrl_vec={g_c}"
-    print(f"[refine] 前向形状 ✓；梯度：net |∑|={g_net:.3e}, ctrl_vec |∑|={g_c:.3e} ✓")
+    print(f"[refine] matte 前向形状 ✓；梯度：net |∑|={g_net:.3e}, ctrl_vec |∑|={g_c:.3e} ✓")
 
-    # ④ 真样本可视化：零初始化起点应≈透传物理渲染（人工核对融合接线正确）。
+    # ④ 真样本可视化：B = α·B_fg + (1−α)·B_bg，带外回落 B_phys（Plan B 选择式重渲，D29）。
+    #    未训练时 α≈0.5（近零初始化），输出≈带内两渲染均值；训练后 α 应学成真前景占比。
     from data.synth import SynthBokehDataset, SynthConfig
     from refine.conditioning import boundary_band, condition_maps
-    from render.renderer import render_field_patch, snap_disparity_edges
+    from render.renderer import (push_band_to_background, render_field_patch,
+                                 snap_disparity_edges)
     ds = SynthBokehDataset(SynthConfig(device=device, seed=3))
     s = ds[0]
     m = s["meta"]
     with torch.no_grad():
         disp = snap_disparity_edges(s["disparity"])
-        phys = render_field_patch(s["image"], disp, m["ctrl"],
+        band = boundary_band(disp, m["ctrl"])
+        B_fg = render_field_patch(s["image"], disp, m["ctrl"],
+                                  m["H_field"], m["azimuth"],
+                                  H_centers=m["H_centers"], H_weights=m["H_weights"])
+        disp_bg = push_band_to_background(disp, m["ctrl"], band=band)
+        B_bg = render_field_patch(s["image"], disp_bg, m["ctrl"],
                                   m["H_field"], m["azimuth"],
                                   H_centers=m["H_centers"], H_weights=m["H_weights"])
         cm = condition_maps(disp, m["ctrl"], m["H_map"], m["az_map"],
                             H_centers=m["H_centers"])
-        gate = boundary_band(disp, m["ctrl"])
-        out = net(s["image"][None], disp[None], phys[None],
-                  s["ctrl_vec"][None], cond_maps=cm[None], mask_gate=gate[None])
-    passthrough_err = float((out["bokeh"][0] - phys).abs().mean())
-    print(f"[refine] 零初始化透传误差 |B−B_phys| = {passthrough_err:.4f}"
-          "（应很小：仅差一次下/上采样软化的一半权重）")
+        out = net(s["image"][None], disp[None], B_fg[None],
+                  s["ctrl_vec"][None], cond_maps=cm[None], mask_gate=band[None])
+        alpha = out["matte"][0]                            # [1,H,W]
+        B_band = alpha * B_fg + (1.0 - alpha) * B_bg
+        B = band * B_band + (1.0 - band) * B_fg            # 带外 = B_phys(=B_fg)
+    print(f"[refine] matte 均值={float(alpha.mean()):.3f}（未训练≈0.5×band）；"
+          f"|B−B_fg| 带内={float((B - B_fg).abs()[band.expand_as(B) > 0.5].mean()):.4f} "
+          f"带外={float((B - B_fg).abs()[band.expand_as(B) <= 0.5].mean()):.4f}（带外应≈0）")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     panels = [("input (all-in-focus)", s["image"]),
-              ("disparity (perturbed)", s["disparity"]),
-              ("B_phys (renderer)", phys),
-              ("B fused (untrained)", out["bokeh"][0]),
-              ("error mask m", out["error_mask"][0, 0]),
+              ("B_fg = B_phys", B_fg),
+              ("B_bg (band→background)", B_bg),
+              ("matte alpha (untrained)", alpha[0]),
+              ("B = matte select", B),
               ("bokeh GT", s["bokeh_gt"])]
     fig, axes = plt.subplots(1, 6, figsize=(22, 4))
     for ax, (name, t) in zip(axes, panels):
@@ -330,10 +491,10 @@ def _smoke_test():
             ax.imshow(arr, cmap="Spectral_r", vmin=0, vmax=1)
         ax.set_title(name, fontsize=9)
         ax.axis("off")
-    fig.suptitle(f"refine/network.py smoke test — {n_params:,} params (untrained, "
-                 "fused≈B_phys expected)", fontsize=11)
+    fig.suptitle(f"refine/network.py Plan B matte smoke — {n_params:,} params "
+                 "(untrained; B=α·B_fg+(1−α)·B_bg, 找补结构上不可能)", fontsize=11)
     fig.tight_layout()
-    out_png = OUT_DIR / "smoke.png"
+    out_png = OUT_DIR / "smoke_matte.png"
     fig.savefig(str(out_png), dpi=100, bbox_inches="tight")
     plt.close(fig)
     print(f"[refine] 可视化 -> {out_png}")
